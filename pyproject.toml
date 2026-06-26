@@ -1,0 +1,130 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flextype"
+version = "0.1.0"
+description = "Lazy and structural helpers for Python dispatch and type checks"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13.0"
+dependencies = []
+authors = [
+    { name = "Clemens Damke", email = "clemens@cortys.de" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: Unix",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+source = "https://github.com/Cortys/flextype"
+tracker = "https://github.com/Cortys/flextype/issues"
+
+[tool.setuptools.packages.find]
+where = ["./src"]
+include = ["flextype", "flextype.*"]
+
+[dependency-groups]
+lint = [
+    "ruff>=0.15.11",
+    "ty>=0.0.32",
+]
+test = [
+    "pytest>=8.0",
+]
+dev = [
+    { include-group = "lint" },
+    { include-group = "test" },
+    "prek>=0.4.5",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+output-format = "full"
+exclude = [
+    ".eggs",
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".ty",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "build",
+    "dist",
+    "venv",
+]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "FBT",
+    "FIX002",
+    "PLR0913",
+    "PLR2004",
+    "RET504",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "ANN001",
+    "ANN201",
+    "ANN202",
+    "C901",
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D404",
+    "FBT001",
+    "INP001",
+    "N803",
+    "PLR2004",
+    "S101",
+    "TCH",
+]
+"__init__.py" = [
+    "I002",
+    "PLC0414",
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.ruff.lint.isort]
+known-first-party = ["flextype"]
+force-sort-within-sections = true
+combine-as-imports = true
+force-single-line = false
+no-lines-before = ["future"]
+required-imports = ["from __future__ import annotations"]
+extra-standard-library = ["typing_extensions"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/flextype"]
+minversion = "8.0"
+pythonpath = ["src"]
+addopts = [
+    "--import-mode=importlib",
+]
+
+[tool.ty.src]
+include = ["src/flextype", "tests/flextype"]
+
+[[tool.ty.overrides]]
+include = ["tests/flextype/**"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"

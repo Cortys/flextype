@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+
+      - name: Ruff check
+        run: uvx ruff check src/flextype tests/flextype
+
+      - name: ty check
+        run: uvx ty check
+
+      - name: Tests
+        run: uv run --python 3.13 --group test pytest tests/flextype

@@ -1,0 +1,33 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Test, coverage, and tool caches
+.coverage
+.coverage.*
+.pytest_cache/
+.ruff_cache/
+.ty/
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment files
+.env
+.env.*
+
+# Editor / OS files
+.idea/
+.vscode/settings.json
+.DS_Store
