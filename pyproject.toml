@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flextype"
-version = "0.1.0"
-description = "Lazy and structural helpers for Python dispatch and type checks"
+version = "0.1.1"
+description = "Making types flexible."
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.13.0"
 dependencies = []
 authors = [
