@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
-from functools import reduce, singledispatch, update_wrapper
-import operator
+from functools import singledispatch, update_wrapper
 from typing import TYPE_CHECKING, Any, SupportsIndex, get_args, overload, override
 from weakref import WeakKeyDictionary
 
@@ -223,7 +222,10 @@ class Flexdispatch[**In, Out]:
         if len(types) == 1:
             res = self._singledispatcher.register(types[0], func)
         else:
-            res = self._singledispatcher.register(reduce(operator.or_, types), func)
+            union_type = types[0]
+            for t in types[1:]:
+                union_type |= t
+            res = self._singledispatcher.register(union_type, func)
 
         for t in types:
             if isinstance(t, RegistryMeta):
