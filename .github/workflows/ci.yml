@@ -19,7 +19,7 @@ jobs:
           python-version: "3.13"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@v8.2.0
 
       - name: Ruff check
         run: uvx ruff check src/flextype tests/flextype
