@@ -18,7 +18,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v8.2.0
@@ -35,7 +35,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.13", "3.14"]
+        python-version: ["3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -51,4 +51,4 @@ jobs:
         uses: astral-sh/setup-uv@v8.2.0
 
       - name: Tests
-        run: uv run --python ${{ matrix.python-version }} --group test pytest tests/flextype
+        run: uv run --locked --python ${{ matrix.python-version }} --group test pytest tests/flextype

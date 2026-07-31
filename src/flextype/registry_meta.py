@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from abc import ABCMeta
 import functools
-from typing import TYPE_CHECKING, Any, Protocol, cast, is_protocol, overload, runtime_checkable
+import sys
+from typing import TYPE_CHECKING, Any, Protocol, cast, overload, runtime_checkable
 from weakref import ReferenceType, WeakSet, ref
 
 from flextype.isinstance import _find_closest_string_type, _split_lazy_type
+
+if sys.version_info >= (3, 13):
+    from typing import is_protocol
+else:
+    from typing_extensions import is_protocol
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -400,6 +406,13 @@ class ProtocolRegistryMeta[T](RegistryMeta[T], type(Protocol)):
         else:
             structural_checking = cls._structural_checking
 
+        protocol_attrs: set[str] | None = getattr(cls, "__protocol_attrs__", None)
+
+        if protocol_attrs is not None:
+            cls.__protocol_attrs__ = protocol_attrs - EXCLUDED_ATTRS
+
+        del protocol_attrs
+
         if not structural_checking:
             # Override Protocol's __subclasshook__ with one that disables structural checking
             # and instead adds lazy subclass registration support to the hook.
@@ -427,11 +440,6 @@ class ProtocolRegistryMeta[T](RegistryMeta[T], type(Protocol)):
                 # In other words: Non-structural ProtocolRegistries should be runtime_checkable by default.
                 # For potential downsides of this approach, please consider cpython issue gh-113320.
                 runtime_checkable(cls)
-
-        protocol_attrs: set[str] | None = getattr(cls, "__protocol_attrs__", None)
-
-        if protocol_attrs is not None:
-            cls.__protocol_attrs__ = protocol_attrs - EXCLUDED_ATTRS
 
         if hasattr(cls, "__instancehook__") and "__instancehook__" not in cls.__dict__:
             # For Protocols, __instancehook__ should not be inherited to derived ProtocolRegistries.

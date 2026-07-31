@@ -9,7 +9,7 @@ This is useful to define marker types, enabling conditional dispatch of objects 
 
 ## Install
 
-`flextype` requires Python 3.13 or newer.
+`flextype` requires Python 3.12 or newer.
 
 ```sh
 pip install flextype

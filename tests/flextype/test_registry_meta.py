@@ -472,6 +472,15 @@ class TestProtocolRegistryMeta:
         assert not issubclass(StructuralButNotNominal, BaseProtocol)
         assert not isinstance(StructuralButNotNominal(), BaseProtocol)
 
+    def test_structural_checking_false_filters_runtime_protocol_member_caches(self) -> None:
+        """Registry internals should be filtered before runtime protocol caches are populated."""
+
+        class BaseProtocol(ProtocolRegistry, structural_checking=False):
+            pass
+
+        assert BaseProtocol.__protocol_attrs__ == set()
+        assert BaseProtocol.__non_callable_proto_members__ == set()  # ty:ignore[unresolved-attribute]
+
     def test_structural_checking_false_propagates_to_protocol_subclasses(self) -> None:
         """Protocol subclasses should inherit non-structural checking from their parent."""
 

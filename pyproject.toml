@@ -4,12 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flextype"
-version = "0.1.1"
+version = "0.1.2"
 description = "Making types flexible."
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.13.0"
-dependencies = []
+requires-python = ">=3.12.0"
+dependencies = [
+    "typing-extensions>=4.7.0; python_version < '3.13'",
+]
 authors = [
     { name = "Clemens Damke", email = "clemens@cortys.de" },
 ]
@@ -20,7 +22,9 @@ classifiers = [
     "Operating System :: Unix",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 
 [project.urls]
@@ -33,8 +37,8 @@ include = ["flextype", "flextype.*"]
 
 [dependency-groups]
 lint = [
-    "ruff>=0.15.11",
-    "ty>=0.0.32",
+    "ruff>=0.16.1",
+    "ty>=0.0.65",
 ]
 test = [
     "pytest>=8.0",
@@ -47,7 +51,7 @@ dev = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py313"
+target-version = "py312"
 output-format = "full"
 exclude = [
     ".eggs",
@@ -67,6 +71,7 @@ exclude = [
 select = ["ALL"]
 ignore = [
     "COM812",
+    "CPY001",
     "FBT",
     "FIX002",
     "PLR0913",
