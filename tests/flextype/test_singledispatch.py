@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC, ABCMeta, abstractmethod
 from collections.abc import Callable
 from functools import singledispatch as functools_singledispatch
+from importlib import import_module
+from pathlib import Path
+import sys
+from types import ModuleType, UnionType
+from typing import get_args
 
 import pytest
 
 from flextype.registry_meta import RegistryMeta
+import flextype.singledispatch as dispatch_module
 from flextype.singledispatch import flexdispatch
 
 
@@ -176,6 +182,97 @@ class TestFunctorParity:
             got(C())
 
 
+class TestCallFastPaths:
+    def test_default_selector_preserves_arguments(self) -> None:
+        f = flexdispatch(lambda *args, **kwargs: ("default", args, kwargs))
+        f.register(int, lambda *args, **kwargs: ("int", args, kwargs))
+        assert f(1, "extra", option=True) == ("int", (1, "extra"), {"option": True})
+
+    def test_custom_selector_is_called_once_and_can_be_replaced(self) -> None:
+        calls = []
+
+        def select(first: object, second: object, *, option: bool) -> object:
+            calls.append((first, second, option))
+            return second
+
+        f = flexdispatch(lambda *_args, **_kwargs: "default", dispatch_on=select)
+        f.register(int, lambda *_args, **_kwargs: "int")
+        assert f(None, 1, option=True) == "int"
+        assert calls == [(None, 1, True)]
+        f.dispatch_on = dispatch_module.first_argument
+        assert f(None, 1, option=True) == "default"
+        assert len(calls) == 1
+        f.dispatch_on = select
+        assert f(None, 1, option=True) == "int"
+        assert len(calls) == 2
+
+    def test_dispatch_uses_visible_class_not_runtime_type(self) -> None:
+        class Proxy:
+            @property
+            def __class__(self) -> type:
+                return int
+
+        f = flexdispatch(lambda _: "default")
+        f.register(int, lambda _: "int")
+        assert f(Proxy()) == "int"
+
+    @pytest.mark.parametrize("override_on_instance", [False, True])
+    def test_call_preserves_dispatch_overrides(
+        self, monkeypatch: pytest.MonkeyPatch, override_on_instance: bool
+    ) -> None:
+        calls = []
+
+        def dispatch(cls: type, *, registry_meta_lookup: object) -> Callable:
+            calls.append((cls, registry_meta_lookup))
+            return lambda _: "override"
+
+        class CustomDispatch(dispatch_module.Flexdispatch):
+            def dispatch(self, cls: type, **kwargs: object) -> Callable:
+                return dispatch(cls, **kwargs)
+
+        f = flexdispatch(lambda _: "default") if override_on_instance else CustomDispatch(lambda _: "default")
+        if override_on_instance:
+            monkeypatch.setattr(f, "dispatch", dispatch)
+        assert f(1) == "override"
+        assert calls == [(int, 1)]
+
+    def test_empty_call_still_raises_before_selector(self) -> None:
+        def unexpected_selector() -> object:
+            pytest.fail("Empty call reached selector")
+
+        f = flexdispatch(lambda: None, dispatch_on=unexpected_selector)
+        with pytest.raises(TypeError, match="requires at least 1 positional argument"):
+            f()
+
+    def test_instance_registry_added_after_warm_call(self) -> None:
+        class Marker(metaclass=RegistryMeta):
+            pass
+
+        value = type("InstanceOnly", (), {})()
+        f = flexdispatch(lambda _: "default")
+        assert f(value) == "default"
+        Marker.register_instance(value)
+        f.register(Marker, lambda _: "marker")
+        assert f(value) == "marker"
+        assert f(object()) == "default"
+
+    @pytest.mark.parametrize("delayed", [False, True])
+    def test_pending_work_added_after_warm_call(self, monkeypatch: pytest.MonkeyPatch, delayed: bool) -> None:
+        f = flexdispatch(lambda _: "default")
+        assert f(1) == "default"
+        module = ModuleType("_flextype_dispatch_after_warm_call")
+        name = f"{module.__name__}:Alias"
+        if delayed:
+            f.delayed_register(name, lambda cls: f.register(cls, lambda _: "int"))
+        else:
+            f.register(name, lambda _: "int")
+        assert f(1) == "default"
+        module.__dict__["Alias"] = int
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        assert f(1) == "int"
+        assert f(1) == "int"
+
+
 class TestAnnotationParsing:
     """Behavior controlled by parse_annotations."""
 
@@ -194,7 +291,7 @@ class TestAnnotationParsing:
         assert f("x") == "object"
         assert f.string_registry == {}
 
-    def test_parse_annotations_false_keeps_string_annotations_lazy(self) -> None:
+    def test_parse_annotations_false_resolves_loaded_string_annotations(self) -> None:
         @flexdispatch(parse_annotations=False)
         def f(value: object) -> str:
             del value
@@ -205,7 +302,7 @@ class TestAnnotationParsing:
             del value
             return "int"
 
-        assert "int" in f.string_registry
+        assert f.string_registry == {}
         assert f(1) == "int"
         assert f.string_registry == {}
 
@@ -239,17 +336,452 @@ class TestAnnotationParsing:
             f.delayed_register(missing_impl)
 
 
+class TestEagerRegistration:
+    """Batching must register each class once while retaining ABC invalidation."""
+
+    @pytest.mark.parametrize("size", [1, 2, 3, 4, 8])
+    @pytest.mark.parametrize("abc_position", ["none", "first", "middle", "last", "all"])
+    def test_each_class_is_registered_once(self, monkeypatch: pytest.MonkeyPatch, size: int, abc_position: str) -> None:
+        positions = {
+            "none": set(),
+            "first": {0},
+            "middle": {size // 2},
+            "last": {size - 1},
+            "all": set(range(size)),
+        }[abc_position]
+        types = tuple((ABCMeta if i in positions else type)(f"T{i}", (), {}) for i in range(size))
+        f = flexdispatch(lambda _: "default")
+        dispatcher = f._singledispatcher  # noqa: SLF001
+        register = dispatcher.register
+        calls = []
+
+        def record(cls: type | UnionType, func: Callable) -> Callable:
+            calls.append(get_args(cls) or (cls,))
+            return register(cls, func)
+
+        monkeypatch.setattr(dispatcher, "register", record)
+        handler = lambda _: "registered"  # noqa: E731
+        assert f._eager_register(types, handler) is handler  # noqa: SLF001
+        registered = [cls for batch in calls for cls in batch]
+        assert len(registered) == size
+        assert set(registered) == set(types)
+        assert len(calls) == (size if size <= 2 else 2 if positions else 1)
+        assert all(dispatcher.registry[cls] is handler for cls in types)
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_batched_abcs_both_track_later_virtual_subclasses(self, reverse: bool) -> None:
+        class First(ABC):
+            @abstractmethod
+            def marker(self) -> None: ...
+
+        class Second(ABC):
+            @abstractmethod
+            def marker(self) -> None: ...
+
+        types = (First, str, Second)
+        f = flexdispatch(lambda _: "default")
+        f._eager_register(types[::-1] if reverse else types, lambda _: "virtual")  # noqa: SLF001
+        for abc in (First, Second):
+            candidate = type("Candidate", (), {})
+            assert f(candidate()) == "default"
+            abc.register(candidate)
+            assert f(candidate()) == "virtual"
+
+    def test_batch_replacement_preserves_registry_meta_and_reverse_index(self) -> None:
+        class Registered(metaclass=RegistryMeta):
+            pass
+
+        class Virtual(ABC):
+            @abstractmethod
+            def marker(self) -> None: ...
+
+        types = (str, Virtual, Registered)
+        f = flexdispatch(lambda _: "default")
+
+        def original(_: object) -> str:
+            return "original"
+
+        def replacement(_: object) -> str:
+            return "replacement"
+
+        f._eager_register(types, original)  # noqa: SLF001
+        assert Registered in f.registry_meta_types
+        f._eager_register(types, replacement)  # noqa: SLF001
+        assert original not in f._types_by_func  # noqa: SLF001
+        assert f._types_by_func[replacement] == set(types)  # noqa: SLF001
+        assert f("text") == "replacement"
+
+
 class TestLazyStringRegistration:
     """Explicit lazy registration via type strings."""
 
-    def test_explicit_string_registration_works_for_non_builtin_type(self) -> None:
+    def test_delayed_registries_track_distinct_lifecycle_stages(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        module = ModuleType("_flextype_delayed_stages")
+        name = f"{module.__name__}:Type"
+        f = flexdispatch(lambda _: "default")
+        calls = []
+
+        def callback(cls: type) -> None:
+            calls.append(cls)
+
+        f.delayed_register(name, callback)
+        f.delayed_register(str, callback)
+        assert f.delayed_string_registration_registry == {name: callback}
+        assert f.delayed_registration_registry == {str: callback}
+
+        module.__dict__["Type"] = int
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        f.dispatch(float, delayed_register=False)
+        assert f.delayed_string_registration_registry == {name: callback}
+        assert f.delayed_registration_registry == {str: callback}
+        assert f(1.0) == "default"
+        assert calls == []
+        assert f.delayed_string_registration_registry == {}
+        assert f.delayed_registration_registry == {str: callback, int: callback}
+
+        assert f(1) == "default"
+        assert calls == [int]
+        assert f.delayed_registration_registry == {str: callback}
+        assert f("text") == "default"
+        assert calls == [int, str]
+        assert f.delayed_registration_registry == {}
+        assert f.delayed_string_registration_registry == {}
+
+    def test_mixed_delayed_dispatch_does_no_resolution_or_index_maintenance(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        f = flexdispatch(lambda _: "default")
+        calls = []
+        f.delayed_register("_flextype_unloaded_mixed:Type", calls.append)
+        f.delayed_register(str, calls.append)
+        f.delayed_register(int, calls.append)
+
+        def unexpected_work(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            pytest.fail("Dispatch attempted string resolution or index maintenance without a loaded module")
+
+        monkeypatch.setattr(dispatch_module, "_resolve_loaded_type", unexpected_work)
+        monkeypatch.setattr(dispatch_module, "_module_name_precheck", unexpected_work)
+        assert f(1) == "default"
+        assert f(1) == "default"
+        assert calls == [int]
+
+    @pytest.mark.parametrize("class_first", [False, True])
+    def test_delayed_promotion_selects_current_callback(
+        self, monkeypatch: pytest.MonkeyPatch, class_first: bool
+    ) -> None:
+        module = ModuleType("_flextype_delayed_collision")
+        f = flexdispatch(lambda _: "default")
+        calls = []
+        if class_first:
+            f.delayed_register(int, lambda _: calls.append("class"))
+        f.delayed_register(f"{module.__name__}:First", lambda _: calls.append("first"))
+        if not class_first:
+            f.delayed_register(int, lambda _: calls.append("class"))
+        f.delayed_register(f"{module.__name__}:Last", lambda _: calls.append("last"))
+        module.__dict__.update(First=int, Last=int)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        assert f(1) == "default"
+        assert calls == ["last"]
+
+    @pytest.mark.parametrize("delayed", [False, True])
+    @pytest.mark.parametrize("reference", [".sub.Type", ":sub.Type", ".sub:Type"])
+    @pytest.mark.parametrize("loaded", ["parent", "child", "both"])
+    def test_module_precedence(
+        self, monkeypatch: pytest.MonkeyPatch, delayed: bool, reference: str, loaded: str
+    ) -> None:
+        parent = ModuleType("_flextype_dispatch_boundary")
+        child = ModuleType(f"{parent.__name__}.sub")
+        parent.__dict__["sub"] = type("Nested", (), {"Type": int})
+        child.__dict__["Type"] = str
+        if loaded != "child":
+            monkeypatch.setitem(sys.modules, parent.__name__, parent)
+        if loaded != "parent":
+            monkeypatch.setitem(sys.modules, child.__name__, child)
+        f = flexdispatch(lambda _: "default")
+        name = parent.__name__ + reference
+        if delayed:
+            f.delayed_register(name, lambda cls: f.register(cls, lambda _: "match"))
+        else:
+            f.register(name, lambda _: "match")
+        expected = str if loaded != "parent" and reference != ":sub.Type" else int
+        unavailable = (reference == ":sub.Type" and loaded == "child") or (
+            reference == ".sub:Type" and loaded == "parent"
+        )
+        assert f(expected()) == ("default" if unavailable else "match")
+        if not unavailable:
+            # Later imports do not retarget an already-resolved registration.
+            monkeypatch.setitem(sys.modules, child.__name__, child)
+            assert f(expected()) == "match"
+
+    @pytest.mark.parametrize("delayed", [False, True])
+    @pytest.mark.parametrize("explicit", [False, True])
+    @pytest.mark.parametrize("resolve_on", ["registration", "dispatch"])
+    @pytest.mark.parametrize("present", [False, True])
+    def test_wait_for_submodule_then_resolve_or_raise(
+        self, monkeypatch: pytest.MonkeyPatch, delayed: bool, explicit: bool, resolve_on: str, present: bool
+    ) -> None:
+        parent = ModuleType("_flextype_dispatch_wait")
+        monkeypatch.setitem(sys.modules, parent.__name__, parent)
+        f = flexdispatch(lambda _: "default")
+        name = f"{parent.__name__}.sub{':' if explicit else '.'}Type"
+        if delayed:
+            f.delayed_register(name, lambda cls: f.register(cls, lambda _: "match"))
+        else:
+            f.register(name, lambda _: "match")
+        assert f(1) == "default"
+        child = ModuleType(f"{parent.__name__}.sub")
+        if present:
+            child.__dict__["Type"] = int
+        monkeypatch.setitem(sys.modules, child.__name__, child)
+
+        def resolve() -> None:
+            if resolve_on == "registration":
+                if delayed:
+                    f.delayed_register(float, lambda _: None)
+                else:
+                    f.register(float, lambda _: "float")
+            else:
+                f(1)
+
+        if present:
+            resolve()
+            assert f(1) == "match"
+        else:
+            with pytest.raises(AttributeError, match="Type"):
+                resolve()
+
+    @pytest.mark.parametrize("resolve_on", ["registration", "dispatch"])
+    def test_register_before_class_definition_and_module_import(
+        self,
+        resolve_on: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        module_name = f"_flextype_class_defined_later_{resolve_on}"
+        monkeypatch.syspath_prepend(str(tmp_path))
+        request.addfinalizer(lambda: sys.modules.pop(module_name, None))
+        name = f"{module_name}.Later"
+
+        @flexdispatch
+        def f(value: object) -> str:
+            del value
+            return "object"
+
+        assert module_name not in sys.modules
+        f.register(name, lambda _: "later")
+        assert name in f.string_registry
+        assert f(object()) == "object"
+        assert name in f.string_registry
+        assert module_name not in sys.modules
+
+        # Only now does the module execute and create the class object.
+        (tmp_path / f"{module_name}.py").write_text("class Later:\n    pass\n", encoding="utf-8")
+        module = import_module(module_name)
+        assert name in f.string_registry
+        if resolve_on == "registration":
+            f.register(int, lambda _: "int")
+            assert name not in f.string_registry
+        assert f(module.Later()) == "later"
+        assert name not in f.string_registry
+
+    def test_namespace_index_observes_module_replacement(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        module = ModuleType("_flextype_replaced_namespace")
+        monkeypatch.setitem(sys.modules, module.__name__, None)
+
+        @flexdispatch
+        def f(value: object) -> str:
+            del value
+            return "object"
+
+        f.register(f"{module.__name__}.Alias", lambda _: "int")
+        assert f(1) == "object"
+        replacement = ModuleType(module.__name__)
+        replacement.__dict__["Alias"] = int
+        monkeypatch.setitem(sys.modules, module.__name__, replacement)
+        assert f(1) == "int"
+
+    def test_unavailable_namespaces_skip_full_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        module_name = "_flextype_no_resolution_until_available"
+
+        @flexdispatch
+        def f(value: object) -> str:
+            del value
+            return "object"
+
+        f.register(f"{module_name}.Alias", lambda _: "int")
+
+        def unexpected_resolution(name: str, pending_modules: set[str] | None = None) -> object:
+            del pending_modules
+            pytest.fail(f"Attempted full resolution of unavailable {name}")
+
+        with monkeypatch.context() as guard:
+            guard.setattr(dispatch_module, "_resolve_loaded_type", unexpected_resolution)
+            assert f(1) == "object"
+
+        module = ModuleType(module_name)
+        module.__dict__["Alias"] = int
+        monkeypatch.setitem(sys.modules, module_name, module)
+        assert f(1) == "int"
+
+    @pytest.mark.parametrize("delayed", [False, True])
+    def test_loaded_parent_is_not_retried_while_waiting_for_child(
+        self, monkeypatch: pytest.MonkeyPatch, delayed: bool
+    ) -> None:
+        parent = ModuleType("_flextype_consume_parent")
+        f = flexdispatch(lambda _: "default")
+        name = f"{parent.__name__}.child.Type"
+        if delayed:
+            f.delayed_register(name, lambda cls: f.register(cls, lambda _: "match"))
+        else:
+            f.register(name, lambda _: "match")
+        monkeypatch.setitem(sys.modules, parent.__name__, parent)
+        assert f(1) == "default"
+
+        def unexpected_resolution(name: str, pending_modules: set[str] | None = None) -> object:
+            del pending_modules
+            pytest.fail(f"Retried an already-examined module for {name}")
+
+        with monkeypatch.context() as guard:
+            guard.setattr(dispatch_module, "_resolve_loaded_type", unexpected_resolution)
+            assert f(1) == "default"
+        child = ModuleType(f"{parent.__name__}.child")
+        child.__dict__["Type"] = int
+        monkeypatch.setitem(sys.modules, child.__name__, child)
+        assert f(1) == "match"
+
+    def test_pending_handlers_are_scanned_once_after_callbacks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        module = ModuleType("_flextype_single_scan")
+
+        @flexdispatch
+        def f(value: object) -> str:
+            del value
+            return "object"
+
+        f.register(f"{module.__name__}.Alias", lambda _: "alias")
+        f.register("_flextype_still_unloaded.Missing", lambda _: "missing")
+
+        @f.delayed_register(int)
+        def load_alias(seen_type: type) -> None:
+            module.__dict__["Alias"] = seen_type
+            f.register(str, lambda _: "str")
+            monkeypatch.setitem(sys.modules, module.__name__, module)
+
+        calls = []
+        resolve = dispatch_module._resolve_loaded_type  # noqa: SLF001
+
+        def counted_resolve(name: str, pending_modules: set[str] | None = None) -> object:
+            calls.append(name)
+            return resolve(name, pending_modules)
+
+        monkeypatch.setattr(dispatch_module, "_resolve_loaded_type", counted_resolve)
+        assert f(1) == "alias"
+        assert calls == [f"{module.__name__}.Alias", "_flextype_still_unloaded.Missing"]
+
+    def test_union_registration_tracks_later_virtual_subclasses(self) -> None:
+        class Virtual(ABC):
+            @abstractmethod
+            def marker(self) -> None: ...
+
+        class Candidate:
+            pass
+
+        @flexdispatch
+        def f(value: object) -> str:
+            del value
+            return "object"
+
+        f.register(Virtual | str, lambda _: "virtual")
+        assert f(Candidate()) == "object"
+        Virtual.register(Candidate)
+        assert f(Candidate()) == "virtual"
+
+    def test_all_available_handlers_are_registered_before_mro_dispatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class Left:
+            pass
+
+        class Right:
+            pass
+
+        class Child(Left, Right):
+            pass
+
+        module = ModuleType("_flextype_pending_mro")
+
+        @flexdispatch
+        def f(value: object) -> str:
+            del value
+            return "object"
+
+        f.register(f"{module.__name__}.Right", lambda _: "right")
+        f.register(f"{module.__name__}.Left", lambda _: "left")
+        module.__dict__.update(Left=Left, Right=Right)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+
+        assert f(Child()) == "left"
+        assert f.string_registry == {}
+        assert f(Right()) == "right"
+
+    def test_available_virtual_abcs_are_ambiguous_on_first_dispatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class First(ABC):
+            @abstractmethod
+            def marker(self) -> None: ...
+
+        class Second(ABC):
+            @abstractmethod
+            def marker(self) -> None: ...
+
+        class Candidate:
+            pass
+
+        First.register(Candidate)
+        Second.register(Candidate)
+        module = ModuleType("_flextype_pending_abcs")
+
+        @flexdispatch
+        def f(value: object) -> str:
+            del value
+            return "object"
+
+        f.register(f"{module.__name__}.First", lambda _: "first")
+        f.register(f"{module.__name__}.Second", lambda _: "second")
+        module.__dict__.update(First=First, Second=Second)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+
+        with pytest.raises(RuntimeError, match="Ambiguous dispatch"):
+            f(Candidate())
+
+    @pytest.mark.parametrize("delayed", [False, True])
+    def test_missing_attribute_raises_with_dynamic_lookup(self, monkeypatch: pytest.MonkeyPatch, delayed: bool) -> None:
+        module = ModuleType("_flextype_pending_attribute")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+
+        @flexdispatch
+        def f(value: object) -> str:
+            del value
+            return "object"
+
+        name = f"{module.__name__}.Alias"
+
+        def dynamic_getattr(attribute):
+            raise AttributeError(attribute)
+
+        module.__dict__["__getattr__"] = dynamic_getattr
+        register = f.delayed_register if delayed else f.register
+        with pytest.raises(AttributeError, match="Alias"):
+            register(name, lambda _: "int")
+
+    def test_explicit_string_registration_works_for_non_builtin_type(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class Base:
             pass
 
         class Child(Base):
             pass
 
-        type_name = f"{Base.__module__}.{Base.__qualname__}"
+        module = ModuleType("_flextype_dispatch_test")
+        module.__dict__["Alias"] = Base
+        type_name = f"{module.__name__}.Alias"
 
         @flexdispatch
         def f(value: object) -> str:
@@ -262,6 +794,7 @@ class TestLazyStringRegistration:
             return "base"
 
         assert type_name in f.string_registry
+        monkeypatch.setitem(sys.modules, module.__name__, module)
         assert f(Child()) == "base"
         assert f.string_registry == {}
 
@@ -281,7 +814,7 @@ class TestLazyStringRegistration:
             del value
             return "full"
 
-        assert list(f.string_registry.keys()) == ["int"]
+        assert f.string_registry == {}
         assert f(1) == "full"
         assert f(2) == "full"
 
@@ -301,13 +834,34 @@ class TestLazyStringRegistration:
             del value
             return "short"
 
-        assert list(f.string_registry.keys()) == ["int"]
+        assert f.string_registry == {}
         assert f(1) == "short"
         assert f(2) == "short"
 
 
 class TestDelayedRegistration:
     """Delayed registration behavior."""
+
+    def test_unloaded_reference_is_retried_after_miss(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        module = ModuleType("_flextype_pending_callback")
+        module.__dict__["Alias"] = int
+        calls = []
+
+        @flexdispatch
+        def f(value: object) -> str:
+            del value
+            return "object"
+
+        @f.delayed_register(f"{module.__name__}.Alias")
+        def register(seen_type: type) -> None:
+            calls.append(seen_type)
+            f.register(int, lambda _: "int")
+
+        assert f(1) == "object"
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        assert f(1) == "int"
+        assert f(2) == "int"
+        assert calls == [int]
 
     def test_delayed_registration_triggers_once_for_matching_type(self) -> None:
         calls: list[type] = []
@@ -383,7 +937,7 @@ class TestDelayedRegistration:
                 del value
                 return "short"
 
-        assert list(f.delayed_registration_registry.keys()) == ["int"]
+        assert list(f.delayed_registration_registry.keys()) == [int]
         assert f(1) == "short"
         assert f(2) == "short"
         assert calls == ["short"]
@@ -414,7 +968,7 @@ class TestDelayedRegistration:
                 del value
                 return "full"
 
-        assert list(f.delayed_registration_registry.keys()) == ["int"]
+        assert list(f.delayed_registration_registry.keys()) == [int]
         assert f(1) == "full"
         assert f(2) == "full"
         assert calls == ["full"]

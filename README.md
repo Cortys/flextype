@@ -25,9 +25,22 @@ uv add flextype
 
 `lazy_isinstance` and `lazy_issubclass` work like `isinstance` and
 `issubclass`, but type references may be real classes, fully qualified string
-names, unions, or tuples. String references are matched against the actual
-runtime type name, so optional dependencies do not need to be imported just to
-perform a check.
+names, unions, or tuples. String references are resolved through `sys.modules`
+and normal attribute lookup, supporting aliases, nested classes and dynamic
+attributes. The resolver does not import missing modules. Unloaded module
+references do not match.
+Resolved references use regular `isinstance` / `issubclass` semantics, including
+virtual subclasses and custom checking hooks, which may also have side effects.
+
+Use `"pkg.submodule:Outer.Type"` to specify the module boundary explicitly.
+Resolution waits only for that module; once it is loaded, missing attributes
+raise `AttributeError`. Dotted references such as `"pkg.submodule.Type"` use the
+longest loaded module prefix, even when a shorter module exposes a different
+nested attribute. If lookup fails, they wait only when a longer module prefix
+could still load. Thus `"pkg.C"` raises if `pkg` is loaded but lacks `C`.
+
+Lazy and delayed dispatcher registrations follow the same rules. Once a
+reference resolves to a class, later imports do not retarget that registration.
 
 ```python
 from pathlib import Path
@@ -182,6 +195,22 @@ whether an object is an instance of the marker type.
 registration concept to instance-level registrations. `Registry` and
 `RegistryMeta` expose the same mechanism for non-protocol marker classes, and
 the metaclasses are exported too when direct metaclass use is the better fit.
+
+Class registries accept the same dotted and `module:qualname` references as
+`flexdispatch`. Available classes are registered immediately; unresolved module
+references are retried on registration, instance checks without a positive
+instance-cache hit, and uncached subclass checks. Resolution registers all
+available references, not just a name matching
+the class being checked. Protocol registries support pending references only
+with `structural_checking=False`; already-loaded string references are eager
+registrations.
+
+Subclass checks use the normal ABC cache and hook. Consequently, an alias to a
+class that previously failed a subclass check can remain a cached miss after
+its module loads, until another uncached check or registration triggers
+promotion. Prefer canonical class paths for registrations; aliases are only
+weakly supported. Ordinary `lazy_isinstance` / `lazy_issubclass` lookups remain
+uncached and may use aliases directly.
 
 ## Development
 

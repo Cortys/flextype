@@ -2,11 +2,240 @@
 
 from __future__ import annotations
 
+from importlib import import_module
+from pathlib import Path
+import sys
+from types import ModuleType
 from typing import Protocol, runtime_checkable
 
 import pytest
 
+import flextype.registry_meta as registry_module
 from flextype.registry_meta import ProtocolRegistry, ProtocolRegistryMeta, RegistrationError, RegistryMeta, annotator
+
+
+@pytest.fixture(params=["registry", "nominal_protocol"])
+def lazy_registry(request: pytest.FixtureRequest) -> RegistryMeta:
+    if request.param == "registry":
+
+        class Base(metaclass=RegistryMeta):
+            pass
+    else:
+
+        class Base(ProtocolRegistry, structural_checking=False):
+            def marker(self) -> None: ...
+
+    return Base
+
+
+class TestLazyRegistryRegistration:
+    def test_registration_before_module_and_class_exist(
+        self,
+        lazy_registry: RegistryMeta,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        module_name = "_flextype_registry_imported_later"
+        monkeypatch.syspath_prepend(str(tmp_path))
+        request.addfinalizer(lambda: sys.modules.pop(module_name, None))
+        lazy_registry.register(f"{module_name}:Later")
+        assert module_name not in sys.modules
+        assert not issubclass(object, lazy_registry)
+        assert module_name not in sys.modules
+        (tmp_path / f"{module_name}.py").write_text("class Later:\n    pass\n", encoding="utf-8")
+        module = import_module(module_name)
+        assert issubclass(module.Later, lazy_registry)
+        assert isinstance(module.Later(), lazy_registry)
+
+    @pytest.mark.parametrize("trigger", ["subclass", "uncached_subclass", "instance", "registration"])
+    @pytest.mark.parametrize("separator", [".", ":"])
+    def test_alias_resolution_after_cached_miss(
+        self, lazy_registry: RegistryMeta, monkeypatch: pytest.MonkeyPatch, trigger: str, separator: str
+    ) -> None:
+        module = ModuleType("_flextype_cached_registry_miss")
+        candidate = type("Candidate", (), {})
+        module.__dict__["Alias"] = candidate
+        name = f"{module.__name__}{separator}Alias"
+        lazy_registry.register(name)
+        value = candidate()
+        assert not issubclass(candidate, lazy_registry)
+        assert not isinstance(value, lazy_registry)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        if trigger == "registration":
+            lazy_registry.register(str)
+        elif trigger == "uncached_subclass":
+            assert not issubclass(type("Unrelated", (), {}), lazy_registry)
+        elif trigger == "instance":
+            assert isinstance(value, lazy_registry)
+        else:
+            # ABC's negative cache bypasses the subclass hook. Aliases to an
+            # already-checked class are weakly supported; an instance check
+            # (or explicit registration) can still promote the reference.
+            assert not issubclass(candidate, lazy_registry)
+            assert name in lazy_registry._string_registry  # noqa: SLF001
+            assert isinstance(value, lazy_registry)
+        assert name not in lazy_registry._string_registry  # noqa: SLF001
+        assert issubclass(candidate, lazy_registry)
+        assert isinstance(value, lazy_registry)
+
+    def test_promote_all_available_references_in_one_pass(
+        self, lazy_registry: RegistryMeta, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module = ModuleType("_flextype_promote_all_registry")
+        first = type("First", (), {})
+        second = type("Second", (), {})
+        module.__dict__.update(First=first, Second=second)
+        missing = "_flextype_still_missing_registry:Type"
+        lazy_registry.register((f"{module.__name__}:First", f"{module.__name__}:Second", missing))
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        split = registry_module._split_lazy_type  # noqa: SLF001
+        calls = []
+
+        def counted_split(classinfo, pending_modules=None):
+            calls.append(classinfo)
+            return split(classinfo, pending_modules)
+
+        monkeypatch.setattr(registry_module, "_split_lazy_type", counted_split)
+        assert issubclass(second, lazy_registry)
+        # The shared splitter recurses internally; only the outer entry uses
+        # the patched module binding, including during ABC registration reentry.
+        assert len(calls) == 1
+        assert first in lazy_registry._subclass_registry  # noqa: SLF001
+        assert second in lazy_registry._subclass_registry  # noqa: SLF001
+        assert lazy_registry._string_registry == {missing}  # noqa: SLF001
+        assert issubclass(first, lazy_registry)
+        assert len(calls) == 1
+
+    def test_eager_resolution_of_loaded_alias(
+        self, lazy_registry: RegistryMeta, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module = ModuleType("_flextype_eager_registry_alias")
+        module.__dict__["Alias"] = int
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        assert lazy_registry.register(f"{module.__name__}:Alias") is lazy_registry
+        assert lazy_registry._string_registry == set()  # noqa: SLF001
+        assert issubclass(int, lazy_registry)
+        assert isinstance(1, lazy_registry)
+
+    def test_only_wait_for_unloaded_modules(self, lazy_registry: RegistryMeta, monkeypatch: pytest.MonkeyPatch) -> None:
+        parent = ModuleType("_flextype_registry_parent")
+        monkeypatch.setitem(sys.modules, parent.__name__, parent)
+        with pytest.raises(AttributeError, match="Missing"):
+            lazy_registry.register(f"{parent.__name__}.Missing")
+        lazy_registry.register(f"{parent.__name__}.child.Type")
+        assert not issubclass(int, lazy_registry)
+        child = ModuleType(f"{parent.__name__}.child")
+        candidate = type("Candidate", (), {})
+        child.__dict__["Type"] = candidate
+        monkeypatch.setitem(sys.modules, child.__name__, child)
+        assert issubclass(candidate, lazy_registry)
+        assert lazy_registry._string_registry == set()  # noqa: SLF001
+
+    def test_loaded_submodule_precedes_parent_alias(
+        self, lazy_registry: RegistryMeta, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        parent = ModuleType("_flextype_registry_shadow")
+        parent.__dict__["child"] = type("Nested", (), {"Type": int})
+        child = ModuleType(f"{parent.__name__}.child")
+        child.__dict__["Type"] = str
+        lazy_registry.register(f"{child.__name__}.Type")
+        monkeypatch.setitem(sys.modules, parent.__name__, parent)
+        monkeypatch.setitem(sys.modules, child.__name__, child)
+        assert issubclass(str, lazy_registry)
+        assert not issubclass(int, lazy_registry)
+
+    def test_unloaded_references_do_not_import_or_rescan(
+        self, lazy_registry: RegistryMeta, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        name = "_flextype_registry_not_imported:Type"
+        lazy_registry.register(name)
+
+        def unexpected_resolution(*args: object, **kwargs: object) -> None:
+            del args, kwargs
+            pytest.fail("Attempted resolution despite an unavailable module")
+
+        monkeypatch.setattr(registry_module, "_split_lazy_type", unexpected_resolution)
+        assert not issubclass(int, lazy_registry)
+        assert not isinstance(1, lazy_registry)
+        assert name in lazy_registry._string_registry  # noqa: SLF001
+
+    def test_promotion_clears_negative_instance_hook_cache(
+        self, lazy_registry: RegistryMeta, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module = ModuleType("_flextype_registry_negative_instance")
+        candidate = type("Candidate", (), {})
+        module.__dict__["Type"] = candidate
+        lazy_registry.register(f"{module.__name__}:Type")
+        calls = []
+        reject = True
+
+        def instancehook(cls, instance):
+            del cls, instance
+            calls.append(True)
+            return False if reject else NotImplemented
+
+        monkeypatch.setattr(lazy_registry, "__instancehook__", classmethod(instancehook), raising=False)
+        value = candidate()
+        assert not isinstance(value, lazy_registry)
+        assert not isinstance(value, lazy_registry)
+        assert len(calls) == 1
+        reject = False
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        assert isinstance(value, lazy_registry)
+        assert len(calls) == 2
+
+    def test_positive_instance_cache_skips_pending_promotion(
+        self, lazy_registry: RegistryMeta, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        value = type("ExplicitInstance", (), {})()
+        lazy_registry.register_instance(value)
+        module = ModuleType("_flextype_registry_positive_fastpath")
+        module.__dict__["Type"] = int
+        name = f"{module.__name__}:Type"
+        lazy_registry.register(name)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+
+        def unexpected_check() -> bool:
+            pytest.fail("Positive cache hit consulted pending modules")
+
+        with monkeypatch.context() as guard:
+            guard.setattr(lazy_registry, "_pending_module_check", unexpected_check)
+            assert isinstance(value, lazy_registry)
+        assert name in lazy_registry._string_registry  # noqa: SLF001
+        assert isinstance(1, lazy_registry)
+        assert name not in lazy_registry._string_registry  # noqa: SLF001
+
+    def test_pending_errors_are_not_swallowed_before_negative_cache(
+        self, lazy_registry: RegistryMeta, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        value = type("NegativeInstance", (), {})()
+        module = ModuleType("_flextype_registry_negative_error")
+        lazy_registry.register(f"{module.__name__}:Type")
+        lazy_registry._negative_register_instance(value)  # noqa: SLF001
+
+        def failing_getattr(name: str) -> object:
+            raise TypeError(name)
+
+        module.__dict__["__getattr__"] = failing_getattr
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        with pytest.raises(TypeError, match="Type"):
+            isinstance(value, lazy_registry)
+
+    @pytest.mark.parametrize("result", [False, True])
+    def test_custom_subclass_hook_remains_authoritative(self, monkeypatch: pytest.MonkeyPatch, result: bool) -> None:
+        class Base(metaclass=RegistryMeta):
+            @classmethod
+            def __subclasshook__(cls, subclass: type) -> bool:
+                return result
+
+        module = ModuleType("_flextype_registry_custom_hook")
+        module.__dict__["Type"] = int
+        Base.register(f"{module.__name__}:Type")
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+        assert issubclass(int, Base) is result
+        assert Base._string_registry == set()  # noqa: SLF001
+        assert int in Base._subclass_registry  # noqa: SLF001
 
 
 class TestRegistryMeta:
@@ -34,7 +263,7 @@ class TestRegistryMeta:
         assert registered is Virtual
         assert isinstance(Virtual(), Base)
 
-    def test_register_lazy_string_adds_virtual_subclass_for_isinstance(self) -> None:
+    def test_register_lazy_string_adds_virtual_subclass_for_isinstance(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Lazy string registrations should resolve to virtual subclasses at runtime."""
 
         class Base(metaclass=RegistryMeta):
@@ -43,11 +272,14 @@ class TestRegistryMeta:
         class Virtual:
             pass
 
-        lazy_name = f"{Virtual.__module__}.{Virtual.__qualname__}"
+        module = ModuleType("_flextype_lazy_registry")
+        module.__dict__["Virtual"] = Virtual
+        lazy_name = f"{module.__name__}.Virtual"
         registered = Base.register(lazy_name)
 
         assert registered is Base
         assert lazy_name in Base._string_registry  # noqa: SLF001
+        monkeypatch.setitem(sys.modules, module.__name__, module)
         assert issubclass(Virtual, Base)
         assert isinstance(Virtual(), Base)
         assert lazy_name not in Base._string_registry  # noqa: SLF001
@@ -645,7 +877,9 @@ class TestProtocolRegistryMeta:
         assert isinstance(concrete_instance, BaseProtocol)
         assert not isinstance(another_concrete_instance, BaseProtocol)
 
-    def test_protocol_registry_lazy_string_registration_works_without_structural_checking(self) -> None:
+    def test_protocol_registry_lazy_string_registration_works_without_structural_checking(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """ProtocolRegistry should support lazy string registrations in non-structural mode."""
 
         class BaseProtocol(ProtocolRegistry, structural_checking=False):
@@ -656,11 +890,14 @@ class TestProtocolRegistryMeta:
             def f(self) -> None:
                 return None
 
-        lazy_name = f"{Virtual.__module__}.{Virtual.__qualname__}"
+        module = ModuleType("_flextype_lazy_protocol_registry")
+        module.__dict__["Virtual"] = Virtual
+        lazy_name = f"{module.__name__}.Virtual"
         registered = BaseProtocol.register(lazy_name)
 
         assert registered is BaseProtocol
         assert lazy_name in BaseProtocol._string_registry  # noqa: SLF001
+        monkeypatch.setitem(sys.modules, module.__name__, module)
         assert issubclass(Virtual, BaseProtocol)
         assert isinstance(Virtual(), BaseProtocol)
         assert lazy_name not in BaseProtocol._string_registry  # noqa: SLF001
@@ -672,10 +909,20 @@ class TestProtocolRegistryMeta:
             def f(self) -> None:
                 return None
 
-        lazy_name = "builtins.list"
+        lazy_name = "_flextype_unloaded_protocol_type:Type"
 
         with pytest.raises(RuntimeError, match="Lazy subclass registration not supported"):
             StructuralProtocol.register(lazy_name)
+
+    def test_structural_protocol_accepts_eager_string_but_retains_runtime_gate(self) -> None:
+        class StructuralProtocol(ProtocolRegistry):
+            def marker(self) -> None: ...
+
+        assert StructuralProtocol.register("builtins:list") is StructuralProtocol
+        with pytest.raises(TypeError, match="runtime_checkable"):
+            issubclass(list, StructuralProtocol)
+        runtime_checkable(StructuralProtocol)
+        assert issubclass(list, StructuralProtocol)
 
     def test_protocol_registry_meta_register_and_register_instance(self) -> None:
         """Direct ProtocolRegistryMeta use should support register and register_instance."""

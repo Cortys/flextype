@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+from abc import ABCMeta
 from contextlib import suppress
 from functools import singledispatch, update_wrapper
 from typing import TYPE_CHECKING, Any, SupportsIndex, get_args, overload, override
-from weakref import WeakKeyDictionary
 
 from flextype.isinstance import (
     LazyType,
-    _find_closest_string_type,
     _is_union_type,
+    _module_name_precheck,
+    _resolve_loaded_type,
     _split_lazy_type,
-    lazy_issubclass,
 )
 from flextype.registry_meta import RegistryMeta
 
@@ -57,14 +57,15 @@ class Flexdispatch[**In, Out]:
     __slots__ = (
         "__dict__",
         "__weakref__",
-        "_delayed_miss_cache",
-        "_delayed_registry_generation",
         "_parse_annotations",
+        "_pending_delayed_module_check",
+        "_pending_delayed_modules",
+        "_pending_module_check",
+        "_pending_modules",
         "_singledispatcher",
-        "_string_miss_cache",
-        "_string_registry_generation",
         "_types_by_func",
         "delayed_registration_registry",
+        "delayed_string_registration_registry",
         "dispatch_on",
         "funcname",
         "registry_meta_types",
@@ -87,28 +88,50 @@ class Flexdispatch[**In, Out]:
         self._singledispatcher = singledispatch(func)
         self.funcname = getattr(func, "__name__", "singledispatch function")
         self.string_registry: dict[str, Callable] = {}
-        self.delayed_registration_registry: dict[str | type, RegistrationFunction] = {}
+        self.delayed_string_registration_registry: dict[str, RegistrationFunction] = {}
+        self.delayed_registration_registry: dict[type, RegistrationFunction] = {}
         self.registry_meta_types: set[RegistryMeta] = set()
         self.dispatch_on: Callable[In, Any] = dispatch_on
         self._parse_annotations = parse_annotations
-        self._delayed_registry_generation = 0
-        self._string_registry_generation = 0
-        self._delayed_miss_cache: WeakKeyDictionary[type, int] = WeakKeyDictionary()
-        self._string_miss_cache: WeakKeyDictionary[type, int] = WeakKeyDictionary()
+        self._pending_modules: set[str] = set()
+        self._pending_module_check = _module_name_precheck(self._pending_modules)
+        self._pending_delayed_modules: set[str] = set()
+        self._pending_delayed_module_check = _module_name_precheck(self._pending_delayed_modules)
         self._types_by_func: dict[Callable, set[type]] = {}
         for registered_type, registered_func in self._singledispatcher.registry.items():
             with suppress(TypeError):
                 self._types_by_func.setdefault(registered_func, set()).add(registered_type)
 
-    def _bump_delayed_registry_generation(self) -> None:
-        self._delayed_registry_generation += 1
-        self._delayed_miss_cache.clear()
+    def _resolve_pending_registrations(self) -> None:
+        """Promote available handlers in one pass, after delayed callbacks."""
+        pending_modules: set[str] = set()
+        for name, func in tuple(self.string_registry.items()):
+            unloaded: set[str] = set()
+            resolved = _resolve_loaded_type(name, unloaded)
+            if isinstance(resolved, type):
+                del self.string_registry[name]
+                self._eager_register((resolved,), func)
+            else:
+                pending_modules.update(unloaded)
+        self._pending_modules = pending_modules
+        self._pending_module_check = _module_name_precheck(self._pending_modules)
 
-    def _bump_string_registry_generation(self) -> None:
-        self._string_registry_generation += 1
-        self._string_miss_cache.clear()
+    def _resolve_pending_delayed_registrations(self) -> None:
+        """Promote delayed strings before selecting callbacks, preserving registry order."""
+        registry = self.delayed_string_registration_registry
+        pending_modules: set[str] = set()
+        for target, func in tuple(registry.items()):
+            unloaded: set[str] = set()
+            resolved = _resolve_loaded_type(target, unloaded)
+            if isinstance(resolved, type):
+                del registry[target]
+                self.delayed_registration_registry[resolved] = func
+            else:
+                pending_modules.update(unloaded)
+        self._pending_delayed_modules = pending_modules
+        self._pending_delayed_module_check = _module_name_precheck(pending_modules)
 
-    def dispatch(  # noqa: C901, PLR0912, PLR0915
+    def dispatch(  # noqa: C901, PLR0912
         self,
         cls: type,
         *,
@@ -116,45 +139,34 @@ class Flexdispatch[**In, Out]:
         registry_meta_lookup: object = NotImplemented,
     ) -> Callable[..., Out]:
         """Find the best available function for the given type or string."""
-        delayed_registration_registry = self.delayed_registration_registry
-        string_registry = self.string_registry
-        if delayed_register and delayed_registration_registry:
-            delayed_generation = self._delayed_registry_generation
-            delayed_miss_generation = self._delayed_miss_cache.get(cls)
-            if delayed_miss_generation != delayed_generation:
-                active_registrations: dict[str | type, RegistrationFunction] = {
-                    t: registration_func
-                    for t, registration_func in delayed_registration_registry.items()
-                    if lazy_issubclass(cls, t)
-                }
+        if (
+            not self.delayed_string_registration_registry
+            and not self.delayed_registration_registry
+            and not self.string_registry
+            and (registry_meta_lookup is NotImplemented or not self.registry_meta_types)
+        ):
+            return self._singledispatcher.dispatch(cls)
 
+        if delayed_register:
+            if self.delayed_string_registration_registry and self._pending_delayed_module_check():
+                self._resolve_pending_delayed_registrations()
+            delayed_registration_registry = self.delayed_registration_registry
+            if delayed_registration_registry:
+                active_registrations = {
+                    t: func for t, func in delayed_registration_registry.items() if issubclass(cls, t)
+                }
                 if active_registrations:
                     for registration_func in active_registrations.values():
                         registration_func(cls)
-
                     for t in active_registrations:
                         delayed_registration_registry.pop(t, None)
 
-                    self._bump_delayed_registry_generation()
-                else:
-                    self._delayed_miss_cache[cls] = delayed_generation
-
-        if string_registry:
-            string_generation = self._string_registry_generation
-            string_miss_generation = self._string_miss_cache.get(cls)
-            if string_miss_generation != string_generation:
-                closest = _find_closest_string_type(cls, string_registry)
-                if closest is not None:
-                    real_type, string_type = closest
-                    registration_func = string_registry.pop(string_type)
-                    self._bump_string_registry_generation()
-                    self._eager_register((real_type,), registration_func)
-                else:
-                    self._string_miss_cache[cls] = string_generation
+        if self.string_registry and self._pending_module_check():
+            self._resolve_pending_registrations()
 
         f = self._singledispatcher.dispatch(cls)
 
-        if registry_meta_lookup is not NotImplemented:
+        if registry_meta_lookup is not NotImplemented and self.registry_meta_types:
             # Check if an instance-level registry registration applies.
             registry_meta_matches: set[type] = set()
             for registry_meta_type in self.registry_meta_types:
@@ -209,24 +221,33 @@ class Flexdispatch[**In, Out]:
 
         return f
 
-    def _eager_register(self, types: tuple[type], func: Callable) -> Callable:
-        """Eagerly register a new implementation for the given type or union type.
-
-        This method simply delegates to the underlying functools.singledispatch instance.
-        Instance-based RegistryMeta types and lazy-string registrations are not supported.
-        To use the full functionality of flexdispatch, use the `register` method instead.
-        """
+    def _eager_register(self, types: tuple[type, ...], func: Callable) -> Callable:  # noqa: PLR0912
+        """Register actual classes, batching without duplicating ABC registrations."""
         registry = self._singledispatcher.registry
         old_functions = {t: registry.get(t) for t in types}
 
-        if len(types) == 1:
-            res = self._singledispatcher.register(types[0], func)
+        if len(types) <= 2:
+            for t in types:
+                self._singledispatcher.register(t, func)
         else:
-            union_type = types[0]
-            for t in types[1:]:
+            remaining = iter(types)
+            union_type = next(remaining)
+            # One direct ABC registration enables cache-token tracking for the
+            # whole dispatcher; that ABC must not also enter the union.
+            if isinstance(union_type, ABCMeta):
+                self._singledispatcher.register(union_type, func)
+                union_type = next(remaining)
+            else:
+                for t in remaining:
+                    if isinstance(t, ABCMeta):
+                        self._singledispatcher.register(t, func)
+                        break
+                    union_type |= t
+            # Continue after the first ABC, or with an exhausted iterator if
+            # there wasn't one. All remaining classes can join the union.
+            for t in remaining:
                 union_type |= t
-            res = self._singledispatcher.register(union_type, func)
-
+            self._singledispatcher.register(union_type, func)
         for t in types:
             if isinstance(t, RegistryMeta):
                 self.registry_meta_types.add(t)
@@ -247,9 +268,9 @@ class Flexdispatch[**In, Out]:
             with suppress(TypeError):
                 self._types_by_func.setdefault(func, set()).add(t)
 
-        return res
+        return func
 
-    def register(self, cls: LazyType | Callable, func: Callable | None = None) -> Callable:
+    def register(self, cls: LazyType | Callable, func: Callable | None = None) -> Callable:  # noqa: PLR0912
         """Register a new implementation for the given type or string."""
         if is_valid_dispatch_type(cls):  # ty: ignore[invalid-argument-type]
             if func is None:
@@ -282,16 +303,19 @@ class Flexdispatch[**In, Out]:
                     msg = f"Invalid annotation for {argname!r}. {cls!r} is not a class or string."
                     raise TypeError(msg)
 
-        types, strings = _split_lazy_type(cls)  # ty: ignore[invalid-argument-type]
+        if self.string_registry and self._pending_module_check():
+            self._resolve_pending_registrations()
+        pending_modules: set[str] = set()
+        types, strings = _split_lazy_type(cls, pending_modules)  # ty: ignore[invalid-argument-type]
 
-        if len(types) > 0:
-            # Use reduce with operator.or_ to dynamically create a Union (PEP 604 style) and avoid private API usage.
+        if types:
             self._eager_register(tuple(types), func)  # ty:ignore[invalid-argument-type]
 
         if len(strings) > 0:
             for s in strings:
                 self.string_registry[s] = func  # ty: ignore[invalid-assignment]
-            self._bump_string_registry_generation()
+            self._pending_modules.update(pending_modules)
+            self._pending_module_check = _module_name_precheck(self._pending_modules)
 
         return func  # ty: ignore[invalid-return-type]
 
@@ -304,7 +328,7 @@ class Flexdispatch[**In, Out]:
     @overload
     def delayed_register(self, cls: LazyType, func: RegistrationFunction) -> RegistrationFunction: ...
 
-    def delayed_register(
+    def delayed_register(  # noqa: PLR0912
         self,
         cls: LazyType | RegistrationFunction,
         func: RegistrationFunction | None = None,
@@ -344,16 +368,21 @@ class Flexdispatch[**In, Out]:
                     msg = f"Invalid annotation for {argname!r}. {cls!r} is not a class or string."
                     raise TypeError(msg)
 
-        types, strings = _split_lazy_type(cls)  # ty: ignore[invalid-argument-type]
+        if self.string_registry and self._pending_module_check():
+            self._resolve_pending_registrations()
+        if self.delayed_string_registration_registry and self._pending_delayed_module_check():
+            self._resolve_pending_delayed_registrations()
+        pending_modules: set[str] = set()
+        types, strings = _split_lazy_type(cls, pending_modules)  # ty: ignore[invalid-argument-type]
 
         for t in types:
             self.delayed_registration_registry[t] = func  # ty: ignore[invalid-assignment]
 
-        for s in strings:
-            self.delayed_registration_registry[s] = func  # ty: ignore[invalid-assignment]
-
-        if types or strings:
-            self._bump_delayed_registry_generation()
+        if len(strings) > 0:
+            for s in strings:
+                self.delayed_string_registration_registry[s] = func  # ty: ignore[invalid-assignment]
+            self._pending_delayed_modules.update(pending_modules)
+            self._pending_delayed_module_check = _module_name_precheck(self._pending_delayed_modules)
 
         return func  # ty: ignore[invalid-return-type]
 
@@ -362,7 +391,8 @@ class Flexdispatch[**In, Out]:
         if not args:
             msg = f"{self.funcname} requires at least 1 positional argument"
             raise TypeError(msg)
-        dispatch_value = self.dispatch_on(*args, **kwargs)  # ty:ignore[invalid-argument-type]
+        dispatch_on = self.dispatch_on
+        dispatch_value = args[0] if dispatch_on is first_argument else dispatch_on(*args, **kwargs)  # ty:ignore[invalid-argument-type]
         return self.dispatch(
             dispatch_value.__class__,
             registry_meta_lookup=dispatch_value,

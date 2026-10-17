@@ -5,10 +5,10 @@ from __future__ import annotations
 from abc import ABCMeta
 import functools
 import sys
-from typing import TYPE_CHECKING, Any, Protocol, cast, overload, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast, overload, runtime_checkable
 from weakref import ReferenceType, WeakSet, ref
 
-from flextype.isinstance import _find_closest_string_type, _split_lazy_type
+from flextype.isinstance import _module_name_precheck, _split_lazy_type
 
 if sys.version_info >= (3, 13):
     from typing import is_protocol
@@ -26,6 +26,8 @@ EXCLUDED_ATTRS = frozenset(
         "_instance_registry",
         "_negative_instance_registry",
         "_string_registry",
+        "_pending_modules",
+        "_pending_module_check",
         "_structural_checking",
     }
 )
@@ -121,42 +123,24 @@ class _IdentityWeakSet[T: object]:
         return False
 
 
-@classmethod
-def _lazy_subclass_hook[T](cls: RegistryMeta[T], subclass: type, /) -> bool:
-    """A __subclasshook__ that checks whether the ."""
-    string_registry = getattr(cls, "_string_registry", None)
+def _make_lazy_subclass_hook(pre_hook: Callable | classmethod | None = None) -> classmethod:
+    """Promote available references on uncached checks, then honor a custom hook."""
+    if isinstance(pre_hook, classmethod):
+        pre_hook = pre_hook.__func__
+    callback = cast("Callable[[RegistryMeta, type], bool] | None", pre_hook)
 
-    if string_registry is not None and len(string_registry) > 0:
-        closest = _find_closest_string_type(subclass, string_registry)
-        if closest is not None:
-            real_type, string_type = closest
-            string_registry.remove(string_type)
-            cls._register(real_type)
+    def hook(cls: RegistryMeta, subclass: type, /) -> bool:
+        if cls._string_registry and cls._pending_module_check():
+            cls._resolve_pending_registrations()
+        return NotImplemented if callback is None else callback(cls, subclass)
 
-    return NotImplemented
+    return classmethod(hook)
 
 
 @classmethod
 def _nop_instancehook[T](_cls: RegistryMeta[T], _instance: object, /) -> bool:
     """A __instancehook__ that does nothing."""
     return NotImplemented
-
-
-def _lazy_subclass_hook_with_pre_hook[T](
-    pre_hook: Callable[[RegistryMeta[T], type], bool],
-) -> Callable[[RegistryMeta[T], type], bool]:
-    """A __subclasshook__ that checks the pre_hook before checking the string registry."""
-
-    @classmethod
-    def hook(cls: RegistryMeta[T], subclass: type, /) -> bool:
-        pre_res = pre_hook(cls, subclass)
-
-        if pre_res is not NotImplemented:
-            return pre_res
-
-        return _lazy_subclass_hook.__func__(cls, subclass)
-
-    return hook
 
 
 class List(list):
@@ -189,7 +173,9 @@ class RegistryMeta[T: object](ABCMeta):
     _instance_registry: _IdentityWeakSet[T]
     _negative_instance_registry: _IdentityWeakSet[object]
     _string_registry: set[str]
-    known_registry_classes: WeakSet[type] = WeakSet()
+    _pending_modules: set[str]
+    _pending_module_check: Callable[[], bool]
+    known_registry_classes: ClassVar[WeakSet[type]] = WeakSet()
 
     def __init__(
         cls,
@@ -205,17 +191,11 @@ class RegistryMeta[T: object](ABCMeta):
         cls._instance_registry: _IdentityWeakSet[T] = _IdentityWeakSet()
         cls._negative_instance_registry: _IdentityWeakSet[object] = _IdentityWeakSet()
         cls._string_registry: set[str] = set()
+        cls._pending_modules = set()
+        cls._pending_module_check = _module_name_precheck(cls._pending_modules)
 
         if not is_protocol(cls):
-            subclasshook = namespace.get("__subclasshook__")
-            if subclasshook is None:
-                subclasshook = _lazy_subclass_hook
-            else:
-                if isinstance(subclasshook, classmethod):
-                    subclasshook = subclasshook.__func__
-                subclasshook = _lazy_subclass_hook_with_pre_hook(subclasshook)
-
-            cls.__subclasshook__ = subclasshook  # ty: ignore[invalid-assignment]
+            cls.__subclasshook__ = _make_lazy_subclass_hook(namespace.get("__subclasshook__"))  # ty: ignore[invalid-assignment]
 
         RegistryMeta.known_registry_classes.add(cls)
 
@@ -243,16 +223,36 @@ class RegistryMeta[T: object](ABCMeta):
 
     def register(cls, subclass: LazyType) -> type:
         """Register a (lazy) subclass or a set of subclasses in registry."""
-        types, strings = _split_lazy_type(subclass)
+        if cls._string_registry and cls._pending_module_check():
+            cls._resolve_pending_registrations()
+        pending_modules: set[str] = set()
+        types, strings = _split_lazy_type(subclass, pending_modules)
         for t in types:
             cls._register(t)
 
         cls._register_lazy(strings)
+        if strings:
+            cls._pending_modules.update(pending_modules)
+            cls._pending_module_check = _module_name_precheck(cls._pending_modules)
         cls._negative_instance_registry = _IdentityWeakSet()
 
         if isinstance(subclass, type):
             return subclass
         return cls
+
+    def _resolve_pending_registrations(cls) -> None:
+        """Promote available references independently of the class being checked."""
+        pending_modules: set[str] = set()
+        types, strings = _split_lazy_type(tuple(cls._string_registry), pending_modules)
+        # Publish the remaining queue before ABCMeta.register re-enters subclass
+        # checking. No registration-in-progress flag or recursive scan is needed.
+        cls._string_registry = strings
+        cls._pending_modules = pending_modules
+        cls._pending_module_check = _module_name_precheck(pending_modules)
+        for subclass in types:
+            cls._register(subclass)
+        if types:
+            cls._negative_instance_registry = _IdentityWeakSet()
 
     def _register_instance[Q](cls: RegistryMeta[T], instance: Q) -> Q:
         try:
@@ -328,13 +328,12 @@ class RegistryMeta[T: object](ABCMeta):
 
     def __instancecheck__(cls, instance: object) -> bool:
         """Check if an instance is in the registry."""
-        try:
-            if instance in cls._instance_registry:
-                return True
-            if instance in cls._negative_instance_registry:
-                return False
-        except TypeError:
-            pass
+        if instance in cls._instance_registry:
+            return True
+        if cls._string_registry and cls._pending_module_check():
+            cls._resolve_pending_registrations()
+        if instance in cls._negative_instance_registry:
+            return False
 
         instancehook = getattr(cls, "__instancehook__", None)
         if instancehook is not None:
@@ -414,26 +413,14 @@ class ProtocolRegistryMeta[T](RegistryMeta[T], type(Protocol)):
         del protocol_attrs
 
         if not structural_checking:
-            # Override Protocol's __subclasshook__ with one that disables structural checking
-            # and instead adds lazy subclass registration support to the hook.
+            # Override Protocol's structural hook, preserving an explicitly
+            # declared custom hook and resolving available lazy references.
 
             # This has to be done here, because Protocol inspects the callstack of __subclasscheck__ to determine
             # whether the subclass check is being called from an isinstance check coming from ABCMeta;
             # see __allow_reckless_class_checks and _ProtocolMeta in typing for details.
             # To align the behavior of ProtocolRegistry and Protocol, __subclasshook__ has to be used.
-            subclasshook: Callable[[RegistryMeta[T], type], bool] | classmethod | None = namespace.get(
-                "__subclasshook__"
-            )
-            if subclasshook is None:
-                subclasshook = _lazy_subclass_hook
-            else:
-                if isinstance(subclasshook, classmethod):
-                    subclasshook = cast(
-                        "Callable[[RegistryMeta[T], type], bool]",
-                        subclasshook.__func__,
-                    )
-                subclasshook = _lazy_subclass_hook_with_pre_hook(subclasshook)
-            cls.__subclasshook__ = subclasshook  # ty:ignore[invalid-assignment]
+            cls.__subclasshook__ = _make_lazy_subclass_hook(namespace.get("__subclasshook__"))  # ty:ignore[invalid-assignment]
 
             if is_protocol(cls):
                 # Disable the gate that prevents Protocols from being checked via isinstance()
