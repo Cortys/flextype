@@ -993,7 +993,7 @@ class TestProtocolRegistryMeta:
 
         assert issubclass(Candidate, BaseProtocol)  # ty:ignore[isinstance-against-protocol]
         assert not issubclass(Candidate, DerivedProtocol)  # ty:ignore[isinstance-against-protocol]
-        assert issubclass(Candidate, DerivedProtocolWithHook)  # ty:ignore[isinstance-against-protocol]
+        assert issubclass(Candidate, DerivedProtocolWithHook)
 
     def test_protocol_instancehook_must_be_declared_per_subclass(self) -> None:
         """Protocol instance hooks should mirror Protocol's subclass-hook inheritance behavior."""

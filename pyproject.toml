@@ -37,8 +37,8 @@ include = ["flextype", "flextype.*"]
 
 [dependency-groups]
 lint = [
-    "ruff>=0.16.1",
-    "ty>=0.0.65",
+    "ruff>=0.17.1",
+    "ty>=0.0.89",
 ]
 test = [
     "pytest>=8.0",

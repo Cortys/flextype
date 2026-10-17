@@ -24,10 +24,10 @@ jobs:
         uses: astral-sh/setup-uv@v8.2.0
 
       - name: Ruff check
-        run: uvx ruff check src/flextype tests/flextype
+        run: uv run --locked --group lint ruff check src/flextype tests/flextype
 
       - name: ty check
-        run: uvx ty check
+        run: uv run --locked --group lint ty check
 
   tests:
     name: Tests (${{ matrix.os }}, ${{ matrix.python-version }})
