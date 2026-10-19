@@ -173,7 +173,13 @@ def test_caster_direct_registration(keyword):
     cast = (
         caster(int, str, cast_fn=str, cost=3, graph=graph)
         if keyword
-        else caster(int, str, str, cost=3, graph=graph)
+        else caster(
+            int,
+            str,
+            str,
+            cost=3,
+            graph=graph,
+        )
     )
     assert isinstance(cast, ConcreteCaster)
     assert cast.cost == 3
