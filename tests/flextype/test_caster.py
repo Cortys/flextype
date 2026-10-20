@@ -377,6 +377,29 @@ def test_invalid_types_do_not_modify_graph_or_cache(source, target):
     assert graph.get_cached_caster(bytes, str) is original
 
 
+@pytest.mark.parametrize("cost", [-1, float("-inf"), float("nan")])
+@pytest.mark.parametrize("inferred", [False, True])
+def test_invalid_costs_do_not_modify_graph_or_caches(cost, inferred):
+    graph = CasterGraph()
+    original = ConcreteCaster(bytes, str, str)
+    graph.add_caster(original)
+    assert graph.get_caster(bytes, str) is original
+    assert graph.get_reachable_types(bytes) == {str}
+
+    def stringify(value: float) -> str:
+        return str(value)
+
+    decorate = (
+        caster(cost=cost, graph=graph) if inferred else caster((int, float), (str, object), cost=cost, graph=graph)
+    )
+    with pytest.raises(ValueError, match="cost must be nonnegative and not NaN"):
+        decorate(stringify)
+
+    _assert_registrations(graph, (bytes,), (str,), str)
+    assert graph.get_cached_caster(bytes, str) is original
+    assert graph.reachable_types == {bytes: {str}}
+
+
 @pytest.mark.parametrize("with_cast_fn", [False, True])
 @pytest.mark.parametrize(
     "types",

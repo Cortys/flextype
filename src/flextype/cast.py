@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, get_cache_token
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -36,7 +36,13 @@ class Caster[S, T](ABC):
     target: type[T]
     """The target type to which this cast can be cast."""
     cost: float = field(default=0.0, kw_only=True)
-    """The cost of the cast, ranked before MRO distance and chain length."""
+    """Nonnegative cost (not NaN), ranked before MRO distance and chain length."""
+
+    def __post_init__(self) -> None:
+        """Reject costs that would invalidate the ranked search."""
+        if not self.cost >= 0:
+            msg = "Caster cost must be nonnegative and not NaN."
+            raise ValueError(msg)
 
     @abstractmethod
     def __call__(self, value: S) -> T:
@@ -187,6 +193,15 @@ class CasterGraph:
     """Cached minimum-cost casts, including unreachable pairs."""
     reachable_types: dict[type, set[type]] = field(default_factory=dict)
     """Cached complete, unrestricted sets of reachable registered targets."""
+    _abc_cache_token: object = field(default_factory=get_cache_token, init=False, repr=False, compare=False)
+
+    def _check_abc_cache(self) -> None:
+        """Lazily invalidate derived caches after virtual ABC registrations."""
+        token = get_cache_token()
+        if token != self._abc_cache_token:
+            self.indirect_casts.clear()
+            self.reachable_types.clear()
+            self._abc_cache_token = token
 
     def add_caster(self, cast: ConcreteCaster) -> None:
         """Add a cast to the graph."""
@@ -202,6 +217,7 @@ class CasterGraph:
 
     def get_cached_caster[S, T](self, source: type[S], target: type[T]) -> Caster[S, T] | None:
         """Get a (cached) indirect cast from the graph."""
+        self._check_abc_cache()
         if issubclass(source, target):
             return _IdentityCaster(source, target)
         if source not in self.indirect_casts:
@@ -265,6 +281,7 @@ class CasterGraph:
         yields to prune cached subtrees with no remaining targets.
         Paths retain parent links and their accumulated rank; no chains are built.
         """
+        self._check_abc_cache()
         # A better rank only rules out another path if it also leaves at least
         # as much of every constrained secondary budget available.
         dominates = _get_dominates(max_mro_distance, max_chain_length)
@@ -332,6 +349,7 @@ class CasterGraph:
         Cached reachability narrows the targets to resolve. Unrestricted results
         update the reachability cache.
         """
+        self._check_abc_cache()
         cached_targets = self.reachable_types.get(source)
         if cached_targets is None:
             registered = {target for edges in self.casts.values() for target in edges}
@@ -377,6 +395,7 @@ class CasterGraph:
         Each caster source is expanded at most once, without a heap or cast chains.
         Complete results are cached; cached subtrees need not be expanded again.
         """
+        self._check_abc_cache()
         if target is not None and issubclass(source, target):
             return {target}
 

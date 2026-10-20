@@ -406,6 +406,28 @@ def test_inferred_target_requires_return_annotation(active_graph):
     assert not active_graph.casts
 
 
+@pytest.mark.parametrize("cost", [-1, float("-inf"), float("nan")])
+def test_invalid_cost_does_not_modify_graph_or_caches(active_graph, cost):
+    original = ConcreteCaster(bytes, str, str)
+    active_graph.add_caster(original)
+    assert active_graph.get_caster(bytes, str) is original
+    assert active_graph.get_reachable_types(bytes) == {str}
+
+    with pytest.raises((RuntimeError, ValueError)) as exc_info:
+
+        class Source:
+            @castmethod(str, cost=cost)
+            def stringify(self) -> str:
+                return "source"
+
+    error = exc_info.value.__cause__ or exc_info.value
+    assert isinstance(error, ValueError)
+    assert "cost must be nonnegative and not NaN" in str(error)
+    assert set(active_graph.casts) == {bytes}
+    assert active_graph.get_cached_caster(bytes, str) is original
+    assert active_graph.reachable_types == {bytes: {str}}
+
+
 def test_method_requires_positional_instance_parameter(active_graph):
     with pytest.raises(TypeError, match="positional instance parameter"):
 

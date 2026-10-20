@@ -150,6 +150,7 @@ registered against their runtime origin (`list`).
 
 All registration forms return the original function unchanged. Registered caster
 metadata remains available through `CasterGraph.get_direct_caster`.
+Costs must be nonnegative and not NaN; positive infinity is allowed.
 
 Use `castmethod` inside a class to register an instance method. The source is
 always the defining class; the target is inferred from the return annotation or

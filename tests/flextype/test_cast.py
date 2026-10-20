@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import partial
 import sys
@@ -89,6 +90,61 @@ def test_fractional_costs_are_summed_and_ranked():
     assert isinstance(cast, _IndirectCaster)
     assert cast.cost == 0.75
     assert cast(4) == "4.0"
+
+
+@pytest.mark.parametrize("cost", [-1, -0.5, float("-inf"), float("nan")])
+def test_caster_rejects_invalid_costs(cost):
+    with pytest.raises(ValueError, match="cost must be nonnegative and not NaN"):
+        ConcreteCaster(int, str, str, cost=cost)
+
+
+@pytest.mark.parametrize("cost", [0, -0.0, 0.5, float("inf")])
+def test_caster_accepts_nonnegative_costs(cost):
+    graph = CasterGraph()
+    direct = ConcreteCaster(int, str, str, cost=cost)
+    graph.add_caster(direct)
+
+    assert graph.get_caster(int, str) is direct
+    assert graph.cast(4, str) == "4"
+
+
+@pytest.mark.parametrize("lookup", ["get_cached_caster", "get_caster", "limited_get_caster", "limited_castable"])
+def test_abc_registration_invalidates_cached_casts(lookup):
+    class Target(ABC):
+        @abstractmethod
+        def marker(self) -> None: ...
+
+    class Nominal(Target):
+        def marker(self) -> None:
+            pass
+
+    class Intermediate:
+        pass
+
+    graph = CasterGraph()
+    original = ConcreteCaster(int, Target, lambda _: Nominal(), cost=5)
+    graph.add_caster(original)
+    graph.add_caster(ConcreteCaster(int, Intermediate, lambda _: Intermediate()))
+    assert graph.get_caster(int, Target) is original
+    graph.get_reachable_types(bytes)
+
+    Target.register(Intermediate)
+
+    if lookup == "get_cached_caster":
+        assert graph.get_cached_caster(int, Target) is None
+    elif lookup == "get_caster":
+        assert graph.get_caster(int, Target).cost == 0
+    elif lookup == "limited_get_caster":
+        assert graph.get_caster(int, Target, max_cost=0).cost == 0
+    else:
+        assert graph.castable(int, Target, max_cost=0)
+    assert graph.reachable_types == {}
+
+    selected = graph.get_caster(int, Target)
+    assert selected.cost == 0
+    assert isinstance(selected(4), Intermediate)
+    assert graph.get_cached_caster(int, Target) is selected
+    assert graph.get_caster(int, Target) is selected
 
 
 @pytest.mark.parametrize("warm_cache", [False, True])

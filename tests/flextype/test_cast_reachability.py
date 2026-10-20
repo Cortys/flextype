@@ -195,6 +195,41 @@ def test_virtual_registered_targets_match_targeted_lookup():
     assert graph.castable(int, Target)
 
 
+@pytest.mark.parametrize("warm_with", ["get_reachable_casters", "get_reachable_types"])
+@pytest.mark.parametrize("lookup", ["get_reachable_casters", "get_reachable_types", "castable"])
+@pytest.mark.parametrize("identity", [False, True])
+def test_abc_registration_invalidates_reachability_caches(warm_with, lookup, identity):
+    class Target(metaclass=ABCMeta):
+        @abstractmethod
+        def marker(self) -> None: ...
+
+    class Nominal(Target):
+        def marker(self) -> None:
+            pass
+
+    class Intermediate:
+        pass
+
+    graph = CasterGraph()
+    if not identity:
+        caster(int, Intermediate, lambda _: Intermediate(), graph=graph)
+    caster(bytes, Target, lambda _: Nominal(), graph=graph)
+    source = Intermediate if identity else int
+    expected = set() if identity else {Intermediate}
+    assert set(getattr(graph, warm_with)(source)) == expected
+    graph.get_caster(bytes, Target)
+
+    Target.register(Intermediate)
+
+    if lookup == "castable":
+        assert graph.castable(source, Target)
+    else:
+        assert set(getattr(graph, lookup)(source)) == expected | {Target}
+    assert graph.indirect_casts == {}
+    assert graph.get_reachable_types(source) == expected | {Target}
+    assert set(graph.get_reachable_casters(source)) == expected | {Target}
+
+
 def test_quick_reachability_handles_inherited_sources_upcasts_and_cycles():
     class Source(int):
         pass
