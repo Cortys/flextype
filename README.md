@@ -143,6 +143,19 @@ registered against their runtime origin (`list`).
 All registration forms return the original function unchanged. Registered caster
 metadata remains available through `CasterGraph.get_direct_caster`.
 
+`get_caster(source, target, graph=...)` returns the best caster without executing
+it. Like `cast`, it uses the active graph when `graph` is omitted and accepts all
+three `max_*` limits.
+
+Use `graph.get_reachable_casters(source, max_cost=..., max_mro_distance=...,
+max_chain_length=...)` to map reachable registered target types to their best
+casters. Ranking and inclusive limits are the same as `graph.get_caster`.
+
+For a quick, unconstrained check, `graph.get_reachable_types(source)` returns a
+set of reachable registered target types without ranking or constructing casts.
+Pass an optional `target` to stop as soon as a compatible type is found; that
+target is included on success, but the remaining results may be incomplete.
+
 ### Registries
 
 `ProtocolRegistry` is useful for defining marker types: runtime-only semantic

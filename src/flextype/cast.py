@@ -125,6 +125,20 @@ def _get_dominates(max_mro_distance: int, max_chain_length: int) -> Callable[[_C
     return _dominates_mro if max_chain_length == sys.maxsize else _dominates_both
 
 
+def _build_caster[S, T](source: type[S], target: type[T], cast_chain: tuple[ConcreteCaster, ...]) -> Caster[S, T]:
+    """Adapt a search path to the requested source and target types."""
+    if not cast_chain:
+        return _IdentityCaster(source, target)
+    if len(cast_chain) == 1:
+        direct = cast_chain[0]
+        return (
+            direct
+            if direct.source is source and direct.target is target
+            else ConcreteCaster(source, target, direct.cast_fn, cost=direct.cost)
+        )
+    return _IndirectCaster(source, target, cast_chain)
+
+
 @dataclass(slots=True, weakref_slot=True)
 class CasterGraph:
     """A graph of casters between types."""
@@ -174,6 +188,36 @@ class CasterGraph:
         if unrestricted and (cached_cast := self.get_cached_caster(source, target)) is not None:
             return cached_cast
 
+        path = next(
+            self._search_casters(
+                source,
+                target,
+                max_cost=max_cost,
+                max_mro_distance=max_mro_distance,
+                max_chain_length=max_chain_length,
+            ),
+            None,
+        )
+        if path is None:
+            msg = f"No cast found from {source} to {target}."
+            raise TypeError(msg)
+
+        result = _build_caster(source, target, path[1])
+        if unrestricted:
+            self.indirect_casts.setdefault(source, {})[target] = result
+        return result
+
+    def _search_casters(
+        self,
+        source: type,
+        target: type | None = None,
+        *,
+        max_cost: float = float("inf"),
+        max_mro_distance: int = sys.maxsize,
+        max_chain_length: int = sys.maxsize,
+    ) -> Generator[tuple[type, tuple[ConcreteCaster, ...]], None, None]:
+        """Yield paths in rank order, stopping at a compatible target if given."""
+        limits = (max_cost, max_mro_distance, max_chain_length)
         # A better rank only rules out another path if it also leaves at least
         # as much of every constrained secondary budget available.
         dominates = _get_dominates(max_mro_distance, max_chain_length)
@@ -185,26 +229,17 @@ class CasterGraph:
         queue: list[tuple[_CastRank, int, type, tuple[ConcreteCaster, ...]]] = []
         if all(limit >= 0 for limit in limits):
             heappush(queue, ((0.0, 0, 0), next(order), source, ()))
-        result: Caster[S, T] | None = None
 
         while queue:
             cost, _, current, cast_chain = heappop(queue)
             total_cost, total_mro_dist, cast_chain_len = cost
             if cost not in costs[current]:
                 continue
-            if issubclass(current, target):
-                if len(cast_chain) == 1:
-                    direct = cast_chain[0]
-                    result = (
-                        direct
-                        if direct.source is source and direct.target is target
-                        else ConcreteCaster(source, target, direct.cast_fn, cost=direct.cost)
-                    )
-                else:
-                    result = (
-                        _IndirectCaster(source, target, cast_chain) if cast_chain else _IdentityCaster(source, target)
-                    )
-                break
+            if target is None:
+                yield current, cast_chain
+            elif issubclass(current, target):
+                yield current, cast_chain
+                return
 
             # Match caster sources against the full MRO in one step: inheritance
             # hops can undercount MRO distance, especially with multiple inheritance.
@@ -224,13 +259,120 @@ class CasterGraph:
                 known_costs.append(candidate)
                 heappush(queue, (candidate, next(order), edge.target, (*cast_chain, edge)))
 
-        if result is None:
-            msg = f"No cast found from {source} to {target}."
-            raise TypeError(msg)
+    def get_reachable_casters[S](
+        self,
+        source: type[S],
+        *,
+        max_cost: float = float("inf"),
+        max_mro_distance: int = sys.maxsize,
+        max_chain_length: int = sys.maxsize,
+    ) -> dict[type, Caster[S, Any]]:
+        """Map reachable registered targets to their best casts within the limits.
 
-        if unrestricted:
-            self.indirect_casts.setdefault(source, {})[target] = result
-        return result
+        Ranking and inclusive limits match ``get_caster``. Compatible subclasses
+        can provide a better cast to a registered target, including identity casts.
+        Unregistered bases are omitted. This lookup does not use the cast cache.
+        """
+        registered = {target for edges in self.casts.values() for target in edges}
+        custom_targets = {
+            target for target in registered if type(target).__subclasscheck__ is not type.__subclasscheck__
+        }
+        nominal_targets = registered - custom_targets
+        results: dict[type, Caster[S, Any]] = {}
+        settled: set[type] = set()
+        for current, cast_chain in self._search_casters(
+            source,
+            max_cost=max_cost,
+            max_mro_distance=max_mro_distance,
+            max_chain_length=max_chain_length,
+        ):
+            if current in settled:
+                continue
+            settled.add(current)
+            targets = nominal_targets.intersection(current.__mro__)
+            targets.update(target for target in custom_targets if issubclass(current, target))
+            for target in targets:
+                results[target] = _build_caster(source, target, cast_chain)
+            nominal_targets.difference_update(targets)
+            custom_targets.difference_update(targets)
+            if not nominal_targets and not custom_targets:
+                break
+        return results
+
+    def get_reachable_types(self, source: type, target: type | None = None) -> set[type]:
+        """Find reachable registered targets without ranking or building casts.
+
+        With ``target``, stop at the first compatible type and include ``target``
+        in the result, even if unregistered. Other results may then be incomplete.
+        Costs and all other limits are ignored; conversions are never executed.
+        Each caster source is expanded at most once, without a heap or cast chains.
+        """
+        if target is not None and issubclass(source, target):
+            return {target}
+
+        reachable: set[type] = set()
+        expanded: set[type] = set()
+        pending = [source]
+        while pending:
+            current = pending.pop()
+            # Each caster source needs expanding only once: no path budgets or
+            # ranks affect whether its outgoing conversions can be followed.
+            for base in current.__mro__:
+                if base in expanded:
+                    continue
+                expanded.add(base)
+                for destination in self.casts.get(base, {}):
+                    if destination in reachable:
+                        continue
+                    reachable.add(destination)
+                    if target is not None and issubclass(destination, target):
+                        reachable.add(target)
+                        return reachable
+                    pending.append(destination)
+
+        if target is None:
+            # Nominal upcasts require only a set intersection. Reserve subclass
+            # checks for targets with custom hooks, such as virtual ABC bases.
+            registered = {destination for edges in self.casts.values() for destination in edges}
+            custom_targets = {
+                destination
+                for destination in registered - reachable - expanded
+                if type(destination).__subclasscheck__ is not type.__subclasscheck__
+            }
+            if custom_targets:
+                reached = reachable | {source}
+                reachable.update(
+                    destination
+                    for destination in custom_targets
+                    if any(issubclass(current, destination) for current in reached)
+                )
+            reachable.update(registered & expanded)
+        return reachable
+
+    def castable(
+        self,
+        source: type,
+        target: type,
+        *,
+        max_cost: float = float("inf"),
+        max_mro_distance: int = sys.maxsize,
+        max_chain_length: int = sys.maxsize,
+    ) -> bool:
+        """Whether a cast is possible within the inclusive path limits.
+
+        Unrestricted checks use quick reachability; limited checks use the ranked
+        search. Neither builds or executes a cast, nor reads or updates the cache.
+        """
+        if (max_cost, max_mro_distance, max_chain_length) == (float("inf"), sys.maxsize, sys.maxsize):
+            return target in self.get_reachable_types(source, target)
+        paths = self._search_casters(
+            source,
+            target,
+            max_cost=max_cost,
+            max_mro_distance=max_mro_distance,
+            max_chain_length=max_chain_length,
+        )
+        return next(paths, None) is not None
 
     def cast[S, T](
         self,
@@ -376,6 +518,26 @@ def caster(
     return decorate if cast_fn is None else decorate(cast_fn)
 
 
+def get_caster[S, T](
+    source: type[S],
+    target: type[T],
+    *,
+    graph: CasterGraph | None = None,
+    max_cost: float = float("inf"),
+    max_mro_distance: int = sys.maxsize,
+    max_chain_length: int = sys.maxsize,
+) -> Caster[S, T]:
+    """Find the best caster from the source to the target within the limits."""
+    active_graph = CASTS.get() if graph is None else graph
+    return active_graph.get_caster(
+        source,
+        target,
+        max_cost=max_cost,
+        max_mro_distance=max_mro_distance,
+        max_chain_length=max_chain_length,
+    )
+
+
 def cast[S, T](
     value: S,
     target: type[T],
@@ -389,6 +551,26 @@ def cast[S, T](
     active_graph = CASTS.get() if graph is None else graph
     return active_graph.cast(
         value,
+        target,
+        max_cost=max_cost,
+        max_mro_distance=max_mro_distance,
+        max_chain_length=max_chain_length,
+    )
+
+
+def castable(
+    source: type,
+    target: type,
+    *,
+    graph: CasterGraph | None = None,
+    max_cost: float = float("inf"),
+    max_mro_distance: int = sys.maxsize,
+    max_chain_length: int = sys.maxsize,
+) -> bool:
+    """Whether the source can reach the target within the limits, without casting."""
+    active_graph = CASTS.get() if graph is None else graph
+    return active_graph.castable(
+        source,
         target,
         max_cost=max_cost,
         max_mro_distance=max_mro_distance,

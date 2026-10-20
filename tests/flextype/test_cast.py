@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from functools import partial
 import sys
+from typing import assert_type
 
 import pytest
 
 from flextype.cast import (
     CASTS,
+    Caster,
     CasterGraph,
     ConcreteCaster,
     _get_dominates,
@@ -14,6 +16,7 @@ from flextype.cast import (
     _IndirectCaster,
     cast,
     caster,
+    get_caster,
 )
 
 
@@ -28,6 +31,16 @@ def cast_api(request):
             yield graph, partial(cast, graph=graph)
         else:
             yield graph, cast
+    finally:
+        CASTS.reset(token)
+
+
+@pytest.fixture(params=["explicit_function", "active_function"])
+def get_caster_api(request):
+    graph = CasterGraph()
+    token = CASTS.set(graph if request.param == "active_function" else CasterGraph())
+    try:
+        yield graph, partial(get_caster, graph=graph) if request.param == "explicit_function" else get_caster
     finally:
         CASTS.reset(token)
 
@@ -768,3 +781,70 @@ def test_caster_explicit_graph_overrides_context_and_invalidates_cache():
         assert active_graph.get_direct_caster(int, str) is None
     finally:
         CASTS.reset(token)
+
+
+def test_get_caster_returns_cached_caster(get_caster_api):
+    graph, lookup = get_caster_api
+    caster(int, str, str, cost=10, graph=graph)
+    caster(int, float, float, cost=1, graph=graph)
+    caster(float, str, str, cost=2, graph=graph)
+
+    selected = lookup(int, str)
+    assert selected.cost == 3
+    assert selected(4) == "4.0"
+    assert selected is graph.get_caster(int, str)
+    assert lookup(int, str) is selected
+
+
+def test_get_caster_explicit_graph_overrides_active_graph():
+    graph = CasterGraph()
+    active_graph = CasterGraph()
+    caster(int, str, lambda _: "explicit", graph=graph)
+    caster(int, str, lambda _: "active", graph=active_graph)
+    token = CASTS.set(active_graph)
+    try:
+        selected = get_caster(int, str, graph=graph)
+        assert_type(selected, Caster[int, str])
+        assert selected(4) == "explicit"
+        assert get_caster(int, str)(4) == "active"
+    finally:
+        CASTS.reset(token)
+
+
+@pytest.mark.parametrize(
+    ("limits", "expected"),
+    [
+        ({"max_cost": 0.75}, "4.0"),
+        ({"max_mro_distance": 1}, "4.0"),
+        ({"max_chain_length": 2}, "4.0"),
+        ({"max_cost": 0.75, "max_mro_distance": 1, "max_chain_length": 2}, "4.0"),
+        ({"max_mro_distance": 0}, "direct"),
+        ({"max_chain_length": 1}, "direct"),
+        ({"max_cost": 0.5}, None),
+        ({"max_chain_length": 0}, None),
+        ({"max_cost": 0.75, "max_mro_distance": 0}, None),
+        ({"max_cost": 0.75, "max_chain_length": 1}, None),
+    ],
+)
+def test_get_caster_respects_limits(get_caster_api, limits, expected):
+    class Source(int):
+        pass
+
+    graph, lookup = get_caster_api
+    caster(int, float, float, cost=0.25, graph=graph)
+    caster(float, str, str, cost=0.5, graph=graph)
+    caster(Source, str, lambda _: "direct", cost=1, graph=graph)
+    cached = lookup(Source, str)
+
+    if expected is None:
+        with pytest.raises(TypeError, match="No cast found"):
+            lookup(Source, str, **limits)
+    else:
+        assert lookup(Source, str, **limits)(Source(4)) == expected
+    assert lookup(Source, str) is cached
+
+
+def test_get_caster_zero_limits_preserve_identity(get_caster_api):
+    _, lookup = get_caster_api
+    selected = lookup(bool, int, max_cost=0, max_mro_distance=0, max_chain_length=0)
+    assert selected(True) is True
