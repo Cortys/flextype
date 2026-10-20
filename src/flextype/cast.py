@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
 from itertools import count
+from operator import le
 import sys
 from typing import TYPE_CHECKING, Any, overload
 
@@ -96,6 +97,31 @@ class _IndirectCaster[S, T](Caster[S, T]):
         return value  # ty: ignore[invalid-return-type]
 
 
+type _CastRank = tuple[float, int, int]
+
+
+def _dominates_mro(left: _CastRank, right: _CastRank) -> bool:
+    """Compare ranks without consuming more of the MRO budget."""
+    return left <= right and left[1] <= right[1]
+
+
+def _dominates_chain(left: _CastRank, right: _CastRank) -> bool:
+    """Compare ranks without consuming more of the chain-length budget."""
+    return left <= right and left[2] <= right[2]
+
+
+def _dominates_both(left: _CastRank, right: _CastRank) -> bool:
+    """Compare ranks without consuming more of either secondary budget."""
+    return left <= right and left[1] <= right[1] and left[2] <= right[2]
+
+
+def _get_dominates(max_mro_distance: int, max_chain_length: int) -> Callable[[_CastRank, _CastRank], bool]:
+    """Select a dominance check once for the active secondary limits."""
+    if max_mro_distance == sys.maxsize:
+        return le if max_chain_length == sys.maxsize else _dominates_chain
+    return _dominates_mro if max_chain_length == sys.maxsize else _dominates_both
+
+
 @dataclass(slots=True, weakref_slot=True)
 class CasterGraph:
     """A graph of casters between types."""
@@ -124,36 +150,46 @@ class CasterGraph:
             return None
         return self.indirect_casts[source].get(target)
 
-    def get_caster[S, T](self, source: type[S], target: type[T]) -> Caster[S, T]:
+    def get_caster[S, T](
+        self,
+        source: type[S],
+        target: type[T],
+        *,
+        max_cost: float = float("inf"),
+        max_mro_distance: int = sys.maxsize,
+        max_chain_length: int = sys.maxsize,
+    ) -> Caster[S, T]:
         """Find a cast minimizing (total cost, total MRO distance, chain length).
 
         MRO distance sums the index of each caster's source in the current type's
         MRO. Chain length counts conversions only; compatible targets need no cast.
+        Each maximum is inclusive. Raise TypeError if no cast satisfies all limits.
+        Limited lookups neither read nor update the unrestricted cast cache.
         """
-        if (cached_cast := self.get_cached_caster(source, target)) is not None:
+        limits = (max_cost, max_mro_distance, max_chain_length)
+        unrestricted = limits == (float("inf"), sys.maxsize, sys.maxsize)
+        if unrestricted and (cached_cast := self.get_cached_caster(source, target)) is not None:
             return cached_cast
 
-        # Search for best indirect cast via Dijkstra and cache it for future use:
-        visited: set[type] = set()
-        costs: dict[type, tuple[float, int, int]] = {source: (0.0, 0, 0)}
-        predecessors: dict[type, tuple[type, ConcreteCaster]] = {}
+        # A better rank only rules out another path if it also leaves at least
+        # as much of every constrained secondary budget available.
+        dominates = _get_dominates(max_mro_distance, max_chain_length)
+
+        # Keep alternative paths to each type when their remaining budgets differ.
+        costs: dict[type, list[_CastRank]] = {source: [(0.0, 0, 0)]}
         # A counter prevents heap ties from comparing type objects.
         order = count()
-        queue: list[tuple[tuple[float, int, int], int, type]] = [((0.0, 0, 0), next(order), source)]
+        queue: list[tuple[_CastRank, int, type, tuple[ConcreteCaster, ...]]] = []
+        if all(limit >= 0 for limit in limits):
+            heappush(queue, ((0.0, 0, 0), next(order), source, ()))
         result: Caster[S, T] | None = None
 
         while queue:
-            cost, _, current = heappop(queue)
+            cost, _, current, cast_chain = heappop(queue)
             total_cost, total_mro_dist, cast_chain_len = cost
-            if current in visited:
+            if cost not in costs[current]:
                 continue
-            visited.add(current)
             if issubclass(current, target):
-                cast_chain: list[ConcreteCaster] = []
-                while current is not source:
-                    current, edge = predecessors[current]
-                    cast_chain.append(edge)
-                cast_chain.reverse()
                 if len(cast_chain) == 1:
                     direct = cast_chain[0]
                     result = (
@@ -162,7 +198,9 @@ class CasterGraph:
                         else ConcreteCaster(source, target, direct.cast_fn, cost=direct.cost)
                     )
                 else:
-                    result = _IndirectCaster(source, target, tuple(cast_chain))
+                    result = (
+                        _IndirectCaster(source, target, cast_chain) if cast_chain else _IdentityCaster(source, target)
+                    )
                 break
 
             # Match caster sources against the full MRO in one step: inheritance
@@ -173,25 +211,42 @@ class CasterGraph:
                 for edge in self.casts.get(base, {}).values()
             )
             for edge, distance in edges:
-                if edge.target in visited:
-                    continue
                 candidate = (total_cost + edge.cost, total_mro_dist + distance, cast_chain_len + 1)
-                if edge.target not in costs or candidate < costs[edge.target]:
-                    costs[edge.target] = candidate
-                    predecessors[edge.target] = (current, edge)
-                    heappush(queue, (candidate, next(order), edge.target))
+                if any(value > limit for value, limit in zip(candidate, limits, strict=True)):
+                    continue
+                known_costs = costs.setdefault(edge.target, [])
+                if any(dominates(known, candidate) for known in known_costs):
+                    continue
+                known_costs[:] = [known for known in known_costs if not dominates(candidate, known)]
+                known_costs.append(candidate)
+                heappush(queue, (candidate, next(order), edge.target, (*cast_chain, edge)))
 
         if result is None:
             msg = f"No cast found from {source} to {target}."
             raise TypeError(msg)
 
-        self.indirect_casts.setdefault(source, {})[target] = result
+        if unrestricted:
+            self.indirect_casts.setdefault(source, {})[target] = result
         return result
 
-    def cast[S, T](self, value: S, target: type[T]) -> T:
+    def cast[S, T](
+        self,
+        value: S,
+        target: type[T],
+        *,
+        max_cost: float = float("inf"),
+        max_mro_distance: int = sys.maxsize,
+        max_chain_length: int = sys.maxsize,
+    ) -> T:
         """Cast a value to the target type."""
         source = type(value)
-        caster = self.get_caster(source, target)
+        caster = self.get_caster(
+            source,
+            target,
+            max_cost=max_cost,
+            max_mro_distance=max_mro_distance,
+            max_chain_length=max_chain_length,
+        )
         return caster(value)
 
 
@@ -229,7 +284,21 @@ def caster[S, T](
     return decorate if cast_fn is None else decorate(cast_fn)
 
 
-def cast[S, T](value: S, target: type[T], *, graph: CasterGraph | None = None) -> T:
+def cast[S, T](
+    value: S,
+    target: type[T],
+    *,
+    graph: CasterGraph | None = None,
+    max_cost: float = float("inf"),
+    max_mro_distance: int = sys.maxsize,
+    max_chain_length: int = sys.maxsize,
+) -> T:
     """Cast a value to the target type."""
     active_graph = CASTS.get() if graph is None else graph
-    return active_graph.cast(value, target)
+    return active_graph.cast(
+        value,
+        target,
+        max_cost=max_cost,
+        max_mro_distance=max_mro_distance,
+        max_chain_length=max_chain_length,
+    )

@@ -1,8 +1,55 @@
 from __future__ import annotations
 
+from functools import partial
+import sys
+
 import pytest
 
-from flextype.cast import CASTS, CasterGraph, ConcreteCaster, _IdentityCaster, _IndirectCaster, cast, caster
+from flextype.cast import (
+    CASTS,
+    CasterGraph,
+    ConcreteCaster,
+    _get_dominates,
+    _IdentityCaster,
+    _IndirectCaster,
+    cast,
+    caster,
+)
+
+
+@pytest.fixture(params=["method", "explicit_function", "active_function"])
+def cast_api(request):
+    graph = CasterGraph()
+    token = CASTS.set(graph if request.param == "active_function" else CasterGraph())
+    try:
+        if request.param == "method":
+            yield graph, graph.cast
+        elif request.param == "explicit_function":
+            yield graph, partial(cast, graph=graph)
+        else:
+            yield graph, cast
+    finally:
+        CASTS.reset(token)
+
+
+@pytest.mark.parametrize(("limit_mro", "limit_chain"), [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ((0.0, 2, 3), (1.0, 1, 2)),
+        ((0.0, 2, 1), (1.0, 1, 2)),
+        ((0.0, 1, 3), (1.0, 2, 2)),
+        ((0.0, 1, 2), (1.0, 2, 3)),
+        ((1.0, 0, 0), (0.0, 1, 1)),
+        ((0.0, 1, 3), (0.0, 1, 2)),
+        ((0.0, 1, 2), (0.0, 1, 3)),
+        ((0.0, 1, 2), (0.0, 1, 2)),
+    ],
+)
+def test_specialized_dominance_matches_active_limits(left, right, limit_mro, limit_chain):
+    dominates = _get_dominates(0 if limit_mro else sys.maxsize, 0 if limit_chain else sys.maxsize)
+    expected = left <= right and (not limit_mro or left[1] <= right[1]) and (not limit_chain or left[2] <= right[2])
+    assert dominates(left, right) is expected
 
 
 def test_cheapest_chain_and_cache():
@@ -28,6 +75,155 @@ def test_fractional_costs_are_summed_and_ranked():
     assert isinstance(cast, _IndirectCaster)
     assert cast.cost == 0.75
     assert cast(4) == "4.0"
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+@pytest.mark.parametrize(
+    ("max_cost", "max_mro_distance", "max_chain_length", "reachable"),
+    [
+        (0.75, 2, 2, True),
+        (0.5, 2, 2, False),
+        (1.0, 1, 2, False),
+        (1.0, 2, 1, False),
+        (1.0, 2, 0, False),
+    ],
+)
+def test_limits_are_inclusive_and_independent(max_cost, max_mro_distance, max_chain_length, reachable, warm_cache):
+    class Source(int):
+        pass
+
+    class Intermediate(float):
+        pass
+
+    graph = CasterGraph()
+    graph.add_caster(ConcreteCaster(int, Intermediate, Intermediate, cost=0.25))
+    graph.add_caster(ConcreteCaster(float, str, str, cost=0.5))
+    cached = graph.get_caster(Source, str) if warm_cache else None
+
+    if reachable:
+        cast = graph.get_caster(
+            Source, str, max_cost=max_cost, max_mro_distance=max_mro_distance, max_chain_length=max_chain_length
+        )
+        assert cast.cost == 0.75
+        assert cast(Source(4)) == "4.0"
+    else:
+        with pytest.raises(TypeError, match="No cast found"):
+            graph.get_caster(
+                Source, str, max_cost=max_cost, max_mro_distance=max_mro_distance, max_chain_length=max_chain_length
+            )
+
+    assert graph.get_cached_caster(Source, str) is cached
+    assert graph.get_caster(Source, str)(Source(4)) == "4.0"
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_chain_limit_selects_more_expensive_direct_cast(warm_cache):
+    graph = CasterGraph()
+    direct = ConcreteCaster(int, str, str, cost=10)
+    graph.add_caster(direct)
+    graph.add_caster(ConcreteCaster(int, float, float, cost=1))
+    graph.add_caster(ConcreteCaster(float, str, str, cost=2))
+    cached = graph.get_caster(int, str) if warm_cache else None
+
+    assert graph.get_caster(int, str, max_chain_length=1) is direct
+    assert graph.get_cached_caster(int, str) is cached
+    assert graph.get_caster(int, str).cost == 3
+    with pytest.raises(TypeError, match="No cast found"):
+        graph.get_caster(int, str, max_cost=3, max_chain_length=1)
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_mro_limit_selects_more_expensive_exact_source(warm_cache):
+    class Source(int):
+        pass
+
+    graph = CasterGraph()
+    exact = ConcreteCaster(Source, str, lambda _: "exact", cost=1)
+    graph.add_caster(exact)
+    graph.add_caster(ConcreteCaster(int, str, lambda _: "inherited"))
+    cached = graph.get_caster(Source, str) if warm_cache else None
+
+    assert graph.get_caster(Source, str, max_mro_distance=0) is exact
+    assert graph.get_cached_caster(Source, str) is cached
+    assert graph.get_caster(Source, str)(Source(4)) == "inherited"
+    with pytest.raises(TypeError, match="No cast found"):
+        graph.get_caster(Source, str, max_cost=0, max_mro_distance=0)
+
+
+@pytest.mark.parametrize("short_cost", [0.0, 1.0])
+def test_chain_limit_keeps_shorter_paths_to_intermediate_types(short_cost):
+    class Source(int):
+        pass
+
+    graph = CasterGraph()
+    graph.add_caster(ConcreteCaster(Source, float, float))
+    graph.add_caster(ConcreteCaster(float, complex, complex))
+    graph.add_caster(ConcreteCaster(float, Source, Source))
+    short = ConcreteCaster(int, complex, complex, cost=short_cost)
+    final = ConcreteCaster(complex, str, str)
+    graph.add_caster(short)
+    graph.add_caster(final)
+
+    cast = graph.get_caster(Source, str, max_chain_length=2)
+    assert isinstance(cast, _IndirectCaster)
+    assert cast.cost == short_cost
+    assert cast.cast_chain == (short, final)
+    assert cast(Source(4)) == "(4+0j)"
+
+    unrestricted = graph.get_caster(Source, str)
+    assert isinstance(unrestricted, _IndirectCaster)
+    assert len(unrestricted.cast_chain) == 3
+    with pytest.raises(TypeError, match="No cast found"):
+        graph.get_caster(Source, str, max_chain_length=1)
+
+
+def test_mro_limit_keeps_more_specific_paths_to_intermediate_types():
+    class Source(int):
+        pass
+
+    class Intermediate(float):
+        pass
+
+    graph = CasterGraph()
+    graph.add_caster(ConcreteCaster(int, Intermediate, Intermediate))
+    exact = ConcreteCaster(Source, Intermediate, Intermediate, cost=1)
+    final = ConcreteCaster(float, str, str)
+    graph.add_caster(exact)
+    graph.add_caster(final)
+
+    cast = graph.get_caster(Source, str, max_mro_distance=1)
+    assert isinstance(cast, _IndirectCaster)
+    assert cast.cost == 1
+    assert cast.cast_chain == (exact, final)
+    assert cast(Source(4)) == "4.0"
+    assert graph.get_caster(Source, str).cost == 0
+    with pytest.raises(TypeError, match="No cast found"):
+        graph.get_caster(Source, str, max_mro_distance=0)
+
+
+@pytest.mark.parametrize(("source", "target"), [(int, int), (bool, int), (int, object)])
+def test_zero_limits_allow_identity_and_upcasts(source, target):
+    value = source(1)
+    cast = CasterGraph().get_caster(source, target, max_cost=0, max_mro_distance=0, max_chain_length=0)
+    assert isinstance(cast, _IdentityCaster)
+    assert cast(value) is value
+
+
+def test_zero_cost_and_mro_limits_allow_exact_conversion():
+    graph = CasterGraph()
+    direct = ConcreteCaster(int, str, str)
+    graph.add_caster(direct)
+    assert graph.get_caster(int, str, max_cost=0, max_mro_distance=0, max_chain_length=1) is direct
+    with pytest.raises(TypeError, match="No cast found"):
+        graph.get_caster(int, str, max_chain_length=0)
+
+
+@pytest.mark.parametrize(("max_cost", "max_mro_distance", "max_chain_length"), [(-1, 0, 0), (0, -1, 0), (0, 0, -1)])
+def test_negative_limits_exclude_identity(max_cost, max_mro_distance, max_chain_length):
+    with pytest.raises(TypeError, match="No cast found"):
+        CasterGraph().get_caster(
+            int, int, max_cost=max_cost, max_mro_distance=max_mro_distance, max_chain_length=max_chain_length
+        )
 
 
 def test_direct_cast_and_replacement_invalidate_cache():
@@ -446,6 +642,51 @@ def test_cast_uses_cheapest_indirect_path():
     caster(float, str, str, graph=graph)
     assert cast(4, str, graph=graph) == "4.0"
     assert graph.cast(4, str) == "4.0"
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+@pytest.mark.parametrize(
+    ("limits", "expected"),
+    [
+        ({"max_cost": 0.75}, "4.0"),
+        ({"max_mro_distance": 1}, "4.0"),
+        ({"max_chain_length": 2}, "4.0"),
+        ({"max_cost": 0.75, "max_mro_distance": 1, "max_chain_length": 2}, "4.0"),
+        ({"max_mro_distance": 0}, "direct"),
+        ({"max_chain_length": 1}, "direct"),
+        ({"max_cost": 1, "max_mro_distance": 0, "max_chain_length": 1}, "direct"),
+        ({"max_cost": 0.5}, None),
+        ({"max_chain_length": 0}, None),
+        ({"max_cost": 0.75, "max_mro_distance": 0}, None),
+        ({"max_cost": 0.75, "max_chain_length": 1}, None),
+    ],
+)
+def test_cast_respects_limits(cast_api, limits, expected, warm_cache):
+    class Source(int):
+        pass
+
+    graph, cast_value = cast_api
+    caster(int, float, float, cost=0.25, graph=graph)
+    caster(float, str, str, cost=0.5, graph=graph)
+    caster(Source, str, lambda _: "direct", cost=1, graph=graph)
+    value = Source(4)
+    cached = graph.get_caster(Source, str) if warm_cache else None
+
+    if expected is None:
+        with pytest.raises(TypeError, match="No cast found"):
+            cast_value(value, str, **limits)
+    else:
+        assert cast_value(value, str, **limits) == expected
+
+    assert graph.get_cached_caster(Source, str) is cached
+    assert cast_value(value, str) == "4.0"
+
+
+@pytest.mark.parametrize("target", [list, object])
+def test_cast_zero_limits_preserve_identity(cast_api, target):
+    _, cast_value = cast_api
+    value = [1, 2]
+    assert cast_value(value, target, max_cost=0, max_mro_distance=0, max_chain_length=0) is value
 
 
 def test_cast_uses_runtime_source_type():
