@@ -8,15 +8,18 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import partial
 from heapq import heappop, heappush
-from inspect import Parameter, signature
+from inspect import Parameter, Signature, signature
 from itertools import count
 from operator import le
 import sys
-from types import UnionType
+from types import FunctionType, UnionType
 from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hints, overload
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+if sys.version_info >= (3, 14):
+    from annotationlib import Format
 
 if sys.version_info >= (3, 13):
     from typing import TypeIs
@@ -550,6 +553,146 @@ def caster(
         return cast_fn
 
     return decorate if cast_fn is None else decorate(cast_fn)
+
+
+if sys.version_info >= (3, 14):
+
+    def _castmethod_signature(cast_fn: FunctionType) -> Signature:
+        """Inspect a method without evaluating deferred annotations prematurely."""
+        return signature(cast_fn, annotation_format=Format.STRING)
+
+else:
+
+    def _castmethod_signature(cast_fn: FunctionType) -> Signature:
+        """Inspect a method with eagerly evaluated or stringized annotations."""
+        return signature(cast_fn)
+
+
+@dataclass(slots=True)
+class _CastMethod:
+    """Register a method once its owning class is available."""
+
+    cast_fn: FunctionType
+    registrations: list[tuple[tuple[type, ...] | None, float, CasterGraph]]
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        """Allow stacked decorators to treat the pending method as callable."""
+        return self.cast_fn(*args, **kwargs)
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Register the owning class as the source, then restore the method."""
+        inferred_targets: tuple[type, ...] = ()
+        if any(targets is None for targets, _, _ in self.registrations):
+            annotation = _castmethod_signature(self.cast_fn).return_annotation
+            if annotation is Signature.empty:
+                msg = "An inferred castmethod must annotate its return type."
+                raise TypeError(msg)
+
+            # Resolve only the return annotation: self needs no type annotation.
+            def annotated_return() -> None:
+                """Carry the method's return annotation without its parameters."""
+
+            annotated_return.__annotations__ = {"return": annotation}
+            localns = {**vars(owner), owner.__name__: owner}
+            for obj in (owner, self.cast_fn):
+                localns.update((param.__name__, param) for param in getattr(obj, "__type_params__", ()))
+            inferred_targets = _caster_types(
+                get_type_hints(annotated_return, self.cast_fn.__globals__, localns)["return"]
+            )
+
+        for targets, cost, graph in self.registrations:
+            for target in inferred_targets if targets is None else targets:
+                graph.add_caster(ConcreteCaster(owner, target, self.cast_fn, cost=cost))
+        setattr(owner, name, self.cast_fn)
+
+
+def _decorate_castmethod(
+    cast_fn: object,
+    target: object,
+    cost: float,
+    graph: CasterGraph | None,
+) -> _CastMethod:
+    """Validate a method function and defer registration until class creation."""
+    method = cast_fn if isinstance(cast_fn, _CastMethod) else None
+    fn = method.cast_fn if method is not None else cast_fn
+    if not isinstance(fn, FunctionType):
+        msg = "A castmethod must decorate an instance method function."
+        raise TypeError(msg)
+    if not any(
+        param.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
+        for param in _castmethod_signature(fn).parameters.values()
+    ):
+        msg = "A castmethod must have a positional instance parameter."
+        raise TypeError(msg)
+
+    targets = None if target is None else _caster_types(target)
+    if method is None:
+        method = _CastMethod(fn, [])
+    method.registrations.append((targets, cost, CASTS.get() if graph is None else graph))
+    return method
+
+
+@overload
+def castmethod[F: Callable[..., Any]](
+    target: type | tuple[type, ...] | None = None,
+    cast_fn: None = None,
+    *,
+    cost: float = 0.0,
+    graph: CasterGraph | None = None,
+) -> Callable[[F], F]: ...
+
+
+@overload
+def castmethod[F: Callable[..., Any]](target: F, /, *, cost: float = 0.0, graph: CasterGraph | None = None) -> F: ...
+
+
+@overload
+def castmethod[F: Callable[..., Any]](
+    target: type | tuple[type, ...] | None = None,
+    *,
+    cast_fn: F,
+    cost: float = 0.0,
+    graph: CasterGraph | None = None,
+) -> F: ...
+
+
+@overload
+def castmethod[F: Callable[..., Any]](
+    target: type | tuple[type, ...], cast_fn: F, *, cost: float = 0.0, graph: CasterGraph | None = None
+) -> F: ...
+
+
+def castmethod(
+    target: object = None,
+    cast_fn: object = None,
+    *,
+    cost: float = 0.0,
+    graph: CasterGraph | None = None,
+) -> Callable[..., Any]:
+    """Register an instance method as a cast from its owning class.
+
+    Use ``@castmethod`` or ``@castmethod(cost=..., graph=...)`` to infer the
+    target from the return annotation, or give it explicitly with
+    ``@castmethod(target)``. Target unions, tuples, and generic origins work
+    as with ``caster``. The source cannot be specified: it is always the class
+    defining the method. Registration occurs during class creation and preserves
+    the original function and normal method binding.
+
+    Intended for instance method definitions in class bodies. Outside a class,
+    decoration alone does not register a cast. Inferred annotation names resolve
+    against module globals and the owning class namespace; pass locally scoped
+    targets explicitly if they are not available in either namespace.
+    """
+    if cast_fn is None and isinstance(target, (FunctionType, _CastMethod, classmethod, staticmethod)):
+        cast_fn = target
+        target = None
+
+    def decorate(cast_fn: Callable[..., Any]) -> Callable[..., Any]:
+        return _decorate_castmethod(cast_fn, target, cost, graph)
+
+    if cast_fn is None:
+        return decorate
+    return _decorate_castmethod(cast_fn, target, cost, graph)
 
 
 def get_caster[S, T](

@@ -151,6 +151,35 @@ registered against their runtime origin (`list`).
 All registration forms return the original function unchanged. Registered caster
 metadata remains available through `CasterGraph.get_direct_caster`.
 
+Use `castmethod` inside a class to register an instance method. The source is
+always the defining class; the target is inferred from the return annotation or
+given explicitly. Cost, graph, unions, tuples, and generic origins work as with
+`caster`:
+
+```python
+from flextype.cast import cast, castmethod
+
+
+class Message:
+    @castmethod
+    def text(self) -> str:
+        return "hello"
+
+    @castmethod(bytes, cost=1)
+    def encode(self):
+        return self.text().encode()
+
+
+assert cast(Message(), str) == "hello"
+assert cast(Message(), bytes) == b"hello"
+```
+
+Registration happens during class creation and preserves normal method binding.
+`castmethod` is intended for instance methods in class bodies: decoration outside
+a class does not register a cast on its own. No source argument is accepted.
+Inferred annotation names resolve against module globals and the owning class
+namespace; otherwise, pass locally scoped target types explicitly.
+
 `get_caster(source, target, graph=...)` returns the best caster without executing
 it. Like `cast`, it uses the active graph when `graph` is omitted and accepts all
 three `max_*` limits.
