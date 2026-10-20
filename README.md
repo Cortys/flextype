@@ -112,6 +112,37 @@ def render_dataframe(value: pd.DataFrame) -> str:
 The delayed callback receives the concrete matching type and runs once. After
 the import, dispatch uses the regular `pd.DataFrame` registration.
 
+### Casting
+
+`caster` registers conversions using the first positional parameter's annotation
+and the return annotation. Use it directly or configure its cost and graph:
+
+```python
+from flextype.cast import cast, caster
+
+
+@caster
+def stringify(value: int) -> str:
+    return str(value)
+
+
+@caster(cost=1)
+def decode(value: bytes | bytearray) -> str:
+    return value.decode()
+
+
+assert cast(4, str) == "4"
+assert cast(b"hello", str) == "hello"
+```
+
+Explicit types are also supported: `caster(int, str, stringify)` or
+`@caster((bytes, bytearray), str)`. Unions and tuples register every source/target
+combination with the same function. Parameterized types such as `list[int]` are
+registered against their runtime origin (`list`).
+
+All registration forms return the original function unchanged. Registered caster
+metadata remains available through `CasterGraph.get_direct_caster`.
+
 ### Registries
 
 `ProtocolRegistry` is useful for defining marker types: runtime-only semantic

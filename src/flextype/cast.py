@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from heapq import heappop, heappush
+from inspect import Parameter, signature
 from itertools import count
 from operator import le
 import sys
-from typing import TYPE_CHECKING, Any, overload
+from types import UnionType
+from typing import TYPE_CHECKING, Any, Union, get_args, get_origin, get_type_hints, overload
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Generator
 
 if sys.version_info >= (3, 13):
     from typing import TypeIs
@@ -253,33 +256,122 @@ class CasterGraph:
 CASTS = ContextVar("CASTS", default=CasterGraph())  # noqa: B039
 
 
-@overload
-def caster[S, T](
-    source: type[S], target: type[T], cast_fn: None = None, *, cost: float = 0.0, graph: CasterGraph | None = None
-) -> Callable[[Callable[[S], T]], ConcreteCaster[S, T]]: ...
+def _caster_types(annotation: object) -> tuple[type, ...]:
+    """Expand type combinations and unwrap parameterized runtime types."""
+    origin = get_origin(annotation)
+    if isinstance(annotation, tuple):
+        members = annotation
+    elif origin in (Union, UnionType):
+        members = get_args(annotation)
+    else:
+        cls = annotation if origin is None else origin
+        if not isinstance(cls, type) or cls is Any:
+            msg = f"Invalid caster type: {annotation!r}; expected a runtime type, union, or tuple of types."
+            raise TypeError(msg)
+        return (cls,)
+
+    if not members:
+        msg = "Caster type tuples must not be empty."
+        raise TypeError(msg)
+    return tuple(dict.fromkeys(cls for member in members for cls in _caster_types(member)))
+
+
+def _infer_caster_types(cast_fn: Callable[..., Any]) -> tuple[object, object]:
+    """Infer types from the first positional parameter and return annotation."""
+    try:
+        parameters = signature(cast_fn).parameters.values()
+    except (TypeError, ValueError) as exc:
+        msg = "Cannot infer caster types from a callable without an inspectable signature."
+        raise TypeError(msg) from exc
+    parameter = next(
+        (param for param in parameters if param.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)),
+        None,
+    )
+    if parameter is None:
+        msg = "An inferred caster must have a positional parameter."
+        raise TypeError(msg)
+    annotations = get_type_hints(cast_fn)
+    if parameter.name not in annotations or "return" not in annotations:
+        msg = "An inferred caster must annotate its first positional parameter and return type."
+        raise TypeError(msg)
+    return annotations[parameter.name], annotations["return"]
 
 
 @overload
-def caster[S, T](
-    source: type[S], target: type[T], cast_fn: Callable[[S], T], *, cost: float = 0.0, graph: CasterGraph | None = None
-) -> ConcreteCaster[S, T]: ...
+def caster[F: Callable[..., Any]](source: F, /, *, cost: float = 0.0, graph: CasterGraph | None = None) -> F: ...
 
 
+@overload
+def caster[F: Callable[..., Any]](*, cast_fn: F, cost: float = 0.0, graph: CasterGraph | None = None) -> F: ...
+
+
+@overload
 def caster[S, T](
-    source: type[S],
-    target: type[T],
-    cast_fn: Callable[[S], T] | None = None,
+    source: type[S] | tuple[type[S], ...],
+    target: type[T] | tuple[type[T], ...],
+    cast_fn: Callable[[S], T],
     *,
     cost: float = 0.0,
     graph: CasterGraph | None = None,
-) -> ConcreteCaster[S, T] | Callable[[Callable[[S], T]], ConcreteCaster[S, T]]:
-    """Register a caster directly, or return a decorator when no function is given."""
+) -> Callable[[S], T]: ...
 
-    def decorate(cast_fn: Callable[[S], T]) -> ConcreteCaster[S, T]:
-        cast = ConcreteCaster(source, target, cast_fn, cost=cost)
+
+@overload
+def caster[S, T](
+    source: type[S] | tuple[type[S], ...],
+    target: type[T] | tuple[type[T], ...],
+    cast_fn: None = None,
+    *,
+    cost: float = 0.0,
+    graph: CasterGraph | None = None,
+) -> Callable[[Callable[[S], T]], Callable[[S], T]]: ...
+
+
+@overload
+def caster[F: Callable[..., Any]](
+    source: None = None,
+    target: None = None,
+    cast_fn: None = None,
+    *,
+    cost: float = 0.0,
+    graph: CasterGraph | None = None,
+) -> Callable[[F], F]: ...
+
+
+def caster(
+    source: type | tuple[type, ...] | Callable[..., Any] | None = None,
+    target: type | tuple[type, ...] | None = None,
+    cast_fn: Callable[..., Any] | None = None,
+    *,
+    cost: float = 0.0,
+    graph: CasterGraph | None = None,
+) -> Callable[..., Any]:
+    """Register casts and return the original function unchanged.
+
+    Use directly as ``@caster`` or configure ``@caster(cost=..., graph=...)``
+    to infer types from the first positional parameter and return annotation.
+    Alternatively, provide both source and target explicitly. Unions and tuples
+    register every source/target combination; parameterized types use their origins.
+    """
+    if target is None and cast_fn is None and callable(source) and not isinstance(source, type):
+        cast_fn = source
+        source = None
+    if (source is None) != (target is None):
+        msg = "Provide both source and target types, or neither to infer them from annotations."
+        raise TypeError(msg)
+
+    def decorate[F: Callable[..., Any]](cast_fn: F) -> F:
+        if not callable(cast_fn):
+            msg = "A caster must be callable."
+            raise TypeError(msg)
+        source_type, target_type = _infer_caster_types(cast_fn) if source is None else (source, target)
+        sources = _caster_types(source_type)
+        targets = _caster_types(target_type)
         active_graph = CASTS.get() if graph is None else graph
-        active_graph.add_caster(cast)
-        return cast
+        for source_type in sources:
+            for target_type in targets:
+                active_graph.add_caster(ConcreteCaster(source_type, target_type, cast_fn, cost=cost))
+        return cast_fn
 
     return decorate if cast_fn is None else decorate(cast_fn)
 

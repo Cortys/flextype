@@ -554,9 +554,12 @@ def test_default_cast_cost_is_zero(registration):
     if registration == "concrete":
         cast = ConcreteCaster(int, str, str)
     elif registration == "direct":
-        cast = caster(int, str, str, graph=graph)
+        assert caster(int, str, str, graph=graph) is str
+        cast = graph.get_direct_caster(int, str)
     else:
-        cast = caster(int, str, graph=graph)(str)
+        assert caster(int, str, graph=graph)(str) is str
+        cast = graph.get_direct_caster(int, str)
+    assert cast is not None
     assert cast.cost == 0
     assert isinstance(cast.cost, float)
 
@@ -568,12 +571,13 @@ def test_caster_registers_in_explicit_graph():
     def stringify(value: int) -> str:
         return str(value)
 
-    assert isinstance(stringify, ConcreteCaster)
-    assert stringify.source is int
-    assert stringify.target is str
-    assert stringify.cost == 3
     assert stringify(4) == "4"
-    assert graph.get_direct_caster(int, str) is stringify
+    registered = graph.get_direct_caster(int, str)
+    assert isinstance(registered, ConcreteCaster)
+    assert registered.source is int
+    assert registered.target is str
+    assert registered.cost == 3
+    assert registered.cast_fn is stringify
 
 
 @pytest.mark.parametrize("keyword", [False, True])
@@ -590,10 +594,12 @@ def test_caster_direct_registration(keyword):
             graph=graph,
         )
     )
-    assert isinstance(cast, ConcreteCaster)
-    assert cast.cost == 3
+    assert cast is str
     assert cast(4) == "4"
-    assert graph.get_direct_caster(int, str) is cast
+    registered = graph.get_direct_caster(int, str)
+    assert registered is not None
+    assert registered.cost == 3
+    assert registered.cast_fn is cast
 
 
 def test_caster_direct_registration_in_active_graph():
@@ -601,7 +607,10 @@ def test_caster_direct_registration_in_active_graph():
     token = CASTS.set(graph)
     try:
         cast = caster(int, str, str)
-        assert graph.get_direct_caster(int, str) is cast
+        assert cast is str
+        registered = graph.get_direct_caster(int, str)
+        assert registered is not None
+        assert registered.cast_fn is cast
     finally:
         CASTS.reset(token)
 
@@ -734,8 +743,11 @@ def test_caster_uses_context_active_at_decoration():
     token = CASTS.set(graph)
     try:
         cast = decorate(str)
-        assert cast.cost == 0
-        assert graph.get_direct_caster(int, str) is cast
+        assert cast is str
+        registered = graph.get_direct_caster(int, str)
+        assert registered is not None
+        assert registered.cost == 0
+        assert registered.cast_fn is cast
     finally:
         CASTS.reset(token)
 
@@ -749,7 +761,10 @@ def test_caster_explicit_graph_overrides_context_and_invalidates_cache():
     try:
         cast = caster(int, str, graph=graph)(str)
         assert not graph.indirect_casts
-        assert graph.get_caster(int, str) is cast
+        assert cast is str
+        registered = graph.get_caster(int, str)
+        assert isinstance(registered, ConcreteCaster)
+        assert registered.cast_fn is cast
         assert active_graph.get_direct_caster(int, str) is None
     finally:
         CASTS.reset(token)
