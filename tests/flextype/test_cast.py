@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import partial
 import sys
 from typing import assert_type
@@ -657,6 +658,86 @@ def test_cast_explicit_graph_overrides_active_graph():
         CASTS.reset(token)
 
 
+def test_single_argument_cast_callable_types():
+    graph = CasterGraph()
+    caster(int, str, str, graph=graph)
+
+    convert = cast(str, graph=graph)
+    assert_type(convert, Callable[[object], str])
+    assert_type(convert(4), str)
+    assert convert(4) == "4"
+
+    convert_method = graph.cast(str)
+    assert_type(convert_method, Callable[[object], str])
+    assert_type(convert_method(4), str)
+    assert convert_method(4) == "4"
+    assert_type(cast(value=4, target=str, graph=graph), str)
+    assert_type(graph.cast(value=4, target=str), str)
+
+
+def test_single_argument_cast_uses_runtime_source_type(cast_api):
+    graph, cast_value = cast_api
+    caster(int, str, lambda _: "int", graph=graph)
+    caster(bool, str, lambda _: "bool", graph=graph)
+    caster(float, str, lambda _: "float", graph=graph)
+
+    convert = cast_value(str)
+    assert convert(4) == "int"
+    assert convert(True) == "bool"
+    assert convert(4.0) == "float"
+    value = "unchanged"
+    assert convert(value) is value
+
+
+def test_single_argument_cast_defers_lookup(cast_api):
+    graph, cast_value = cast_api
+    convert = cast_value(str)
+    assert not graph.indirect_casts
+
+    with pytest.raises(TypeError, match="No cast found"):
+        convert(4)
+    caster(int, str, str, graph=graph)
+    assert convert(4) == "4"
+    caster(int, str, lambda _: "replacement", graph=graph)
+    assert convert(4) == "replacement"
+
+
+def test_single_argument_cast_uses_context_at_invocation():
+    graph = CasterGraph()
+    other_graph = CasterGraph()
+    caster(int, str, lambda _: "first", graph=graph)
+    caster(int, str, lambda _: "second", graph=other_graph)
+    token = CASTS.set(graph)
+    try:
+        convert = cast(str)
+        explicit_convert = cast(str, graph=graph)
+        assert convert(4) == "first"
+        other_token = CASTS.set(other_graph)
+        try:
+            assert convert(4) == "second"
+            assert explicit_convert(4) == "first"
+        finally:
+            CASTS.reset(other_token)
+        assert convert(4) == "first"
+    finally:
+        CASTS.reset(token)
+
+
+def test_single_argument_cast_propagates_conversion_error(cast_api):
+    graph, cast_value = cast_api
+    caster(str, int, int, graph=graph)
+    convert = cast_value(int)
+    with pytest.raises(ValueError, match="invalid literal"):
+        convert("not an integer")
+
+
+@pytest.mark.parametrize("target", [4, None, "str"])
+def test_single_argument_cast_requires_type(cast_api, target):
+    _, cast_value = cast_api
+    with pytest.raises(TypeError, match="requires a target type"):
+        cast_value(target)
+
+
 def test_cast_uses_cheapest_indirect_path():
     graph = CasterGraph()
     caster(int, str, str, cost=10, graph=graph)
@@ -666,6 +747,7 @@ def test_cast_uses_cheapest_indirect_path():
     assert graph.cast(4, str) == "4.0"
 
 
+@pytest.mark.parametrize("curried", [False, True])
 @pytest.mark.parametrize("warm_cache", [False, True])
 @pytest.mark.parametrize(
     ("limits", "expected"),
@@ -683,7 +765,7 @@ def test_cast_uses_cheapest_indirect_path():
         ({"max_cost": 0.75, "max_chain_length": 1}, None),
     ],
 )
-def test_cast_respects_limits(cast_api, limits, expected, warm_cache):
+def test_cast_respects_limits(cast_api, limits, expected, warm_cache, curried):
     class Source(int):
         pass
 
@@ -693,22 +775,29 @@ def test_cast_respects_limits(cast_api, limits, expected, warm_cache):
     caster(Source, str, lambda _: "direct", cost=1, graph=graph)
     value = Source(4)
     cached = graph.get_caster(Source, str) if warm_cache else None
+    convert = cast_value(str, **limits) if curried else partial(cast_value, target=str, **limits)
 
     if expected is None:
         with pytest.raises(TypeError, match="No cast found"):
-            cast_value(value, str, **limits)
+            convert(value)
     else:
-        assert cast_value(value, str, **limits) == expected
+        assert convert(value) == expected
 
     assert graph.get_cached_caster(Source, str) is cached
     assert cast_value(value, str) == "4.0"
 
 
+@pytest.mark.parametrize("curried", [False, True])
 @pytest.mark.parametrize("target", [list, object])
-def test_cast_zero_limits_preserve_identity(cast_api, target):
+def test_cast_zero_limits_preserve_identity(cast_api, target, curried):
     _, cast_value = cast_api
     value = [1, 2]
-    assert cast_value(value, target, max_cost=0, max_mro_distance=0, max_chain_length=0) is value
+    convert = (
+        cast_value(target, max_cost=0, max_mro_distance=0, max_chain_length=0)
+        if curried
+        else partial(cast_value, target=target, max_cost=0, max_mro_distance=0, max_chain_length=0)
+    )
+    assert convert(value) is value
 
 
 def test_cast_uses_runtime_source_type():

@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import partial
 from heapq import heappop, heappush
 from inspect import Parameter, signature
 from itertools import count
@@ -374,6 +375,18 @@ class CasterGraph:
         )
         return next(paths, None) is not None
 
+    @overload
+    def cast[T](
+        self,
+        target: type[T],
+        /,
+        *,
+        max_cost: float = float("inf"),
+        max_mro_distance: int = sys.maxsize,
+        max_chain_length: int = sys.maxsize,
+    ) -> Callable[[object], T]: ...
+
+    @overload
     def cast[S, T](
         self,
         value: S,
@@ -382,8 +395,29 @@ class CasterGraph:
         max_cost: float = float("inf"),
         max_mro_distance: int = sys.maxsize,
         max_chain_length: int = sys.maxsize,
-    ) -> T:
-        """Cast a value to the target type."""
+    ) -> T: ...
+
+    def cast(
+        self,
+        value: object,
+        target: type | None = None,
+        *,
+        max_cost: float = float("inf"),
+        max_mro_distance: int = sys.maxsize,
+        max_chain_length: int = sys.maxsize,
+    ) -> object:
+        """Cast a value, or return a value-taking callable with ``cast(target)``."""
+        if target is None:
+            if not isinstance(value, type):
+                msg = "A single-argument cast requires a target type."
+                raise TypeError(msg)
+            return partial(
+                self.cast,
+                target=value,
+                max_cost=max_cost,
+                max_mro_distance=max_mro_distance,
+                max_chain_length=max_chain_length,
+            )
         source = type(value)
         caster = self.get_caster(
             source,
@@ -538,6 +572,19 @@ def get_caster[S, T](
     )
 
 
+@overload
+def cast[T](
+    target: type[T],
+    /,
+    *,
+    graph: CasterGraph | None = None,
+    max_cost: float = float("inf"),
+    max_mro_distance: int = sys.maxsize,
+    max_chain_length: int = sys.maxsize,
+) -> Callable[[object], T]: ...
+
+
+@overload
 def cast[S, T](
     value: S,
     target: type[T],
@@ -546,8 +593,35 @@ def cast[S, T](
     max_cost: float = float("inf"),
     max_mro_distance: int = sys.maxsize,
     max_chain_length: int = sys.maxsize,
-) -> T:
-    """Cast a value to the target type."""
+) -> T: ...
+
+
+def cast(
+    value: object,
+    target: type | None = None,
+    *,
+    graph: CasterGraph | None = None,
+    max_cost: float = float("inf"),
+    max_mro_distance: int = sys.maxsize,
+    max_chain_length: int = sys.maxsize,
+) -> object:
+    """Cast a value, or return a value-taking callable with ``cast(target)``.
+
+    The callable preserves the graph and limits, resolving the active graph at
+    invocation time when no explicit graph is given.
+    """
+    if target is None:
+        if not isinstance(value, type):
+            msg = "A single-argument cast requires a target type."
+            raise TypeError(msg)
+        return partial(
+            cast,
+            target=value,
+            graph=graph,
+            max_cost=max_cost,
+            max_mro_distance=max_mro_distance,
+            max_chain_length=max_chain_length,
+        )
     active_graph = CASTS.get() if graph is None else graph
     return active_graph.cast(
         value,

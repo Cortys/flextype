@@ -133,7 +133,15 @@ def decode(value: bytes | bytearray) -> str:
 
 assert cast(4, str) == "4"
 assert cast(b"hello", str) == "hello"
+
+to_str = cast(str)
+assert to_str(4) == "4"
+assert to_str(b"hello") == "hello"
 ```
+
+With one positional argument, `cast(target)` returns a callable accepting a value.
+It preserves any explicit `graph` and `max_*` limits; otherwise, it uses the active
+graph when the callable is invoked. `graph.cast(target)` supports the same form.
 
 Explicit types are also supported: `caster(int, str, stringify)` or
 `@caster((bytes, bytearray), str)`. Unions and tuples register every source/target
