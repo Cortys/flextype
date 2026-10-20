@@ -14,6 +14,7 @@ from .registry_meta import (
     get_explicit_registry_classes,
 )
 from .singledispatch import Flexdispatch, flexdispatch, is_valid_dispatch_type
+from .switchdispatch import switch, switchdispatch
 
 __all__ = [
     "Flexdispatch",
@@ -33,4 +34,6 @@ __all__ = [
     "lazy_isinstance",
     "lazy_issubclass",
     "registry_pickle",
+    "switch",
+    "switchdispatch",
 ]
