@@ -20,6 +20,7 @@ def lazy_registry(request: pytest.FixtureRequest) -> RegistryMeta:
 
         class Base(metaclass=RegistryMeta):
             pass
+
     else:
 
         class Base(ProtocolRegistry, structural_checking=False):
@@ -927,6 +928,7 @@ class TestProtocolRegistryMeta:
     def test_protocol_registry_meta_register_and_register_instance(self) -> None:
         """Direct ProtocolRegistryMeta use should support register and register_instance."""
 
+        @runtime_checkable
         class DirectProtocol(Protocol, metaclass=ProtocolRegistryMeta, structural_checking=False):
             def f(self) -> None:
                 return None
@@ -941,20 +943,20 @@ class TestProtocolRegistryMeta:
         concrete_instance = Concrete()
         another_concrete_instance = Concrete()
 
-        assert not issubclass(Virtual, DirectProtocol)  # ty:ignore[isinstance-against-protocol]
-        assert not isinstance(virtual_instance, DirectProtocol)  # ty:ignore[isinstance-against-protocol]
-        assert not isinstance(concrete_instance, DirectProtocol)  # ty:ignore[isinstance-against-protocol]
-        assert not isinstance(another_concrete_instance, DirectProtocol)  # ty:ignore[isinstance-against-protocol]
+        assert not issubclass(Virtual, DirectProtocol)
+        assert not isinstance(virtual_instance, DirectProtocol)
+        assert not isinstance(concrete_instance, DirectProtocol)
+        assert not isinstance(another_concrete_instance, DirectProtocol)
 
         registered = DirectProtocol.register(Virtual)
         assert registered is Virtual
-        assert issubclass(Virtual, DirectProtocol)  # ty:ignore[isinstance-against-protocol]
-        assert isinstance(virtual_instance, DirectProtocol)  # ty:ignore[isinstance-against-protocol]
+        assert issubclass(Virtual, DirectProtocol)
+        assert isinstance(virtual_instance, DirectProtocol)
 
         returned_instance = DirectProtocol.register_instance(concrete_instance)
         assert returned_instance is concrete_instance
-        assert isinstance(concrete_instance, DirectProtocol)  # ty:ignore[isinstance-against-protocol]
-        assert not isinstance(another_concrete_instance, DirectProtocol)  # ty:ignore[isinstance-against-protocol]
+        assert isinstance(concrete_instance, DirectProtocol)
+        assert not isinstance(another_concrete_instance, DirectProtocol)
 
     def test_regular_subclass_relationships_work_for_protocol_registry_meta(self) -> None:
         """Regular inheritance should still satisfy issubclass and isinstance."""
@@ -975,14 +977,17 @@ class TestProtocolRegistryMeta:
     def test_protocol_subclasshook_must_be_declared_per_subclass(self) -> None:
         """Protocol subclass hooks should not be inherited implicitly."""
 
+        @runtime_checkable
         class BaseProtocol(ProtocolRegistry, Protocol, structural_checking=False):
             @classmethod
             def __subclasshook__(cls, subclass: type, /) -> bool:
                 return True
 
+        @runtime_checkable
         class DerivedProtocol(BaseProtocol, Protocol):
             pass
 
+        @runtime_checkable
         class DerivedProtocolWithHook(BaseProtocol, Protocol):
             @classmethod
             def __subclasshook__(cls, subclass: type, /) -> bool:
@@ -991,21 +996,24 @@ class TestProtocolRegistryMeta:
         class Candidate:
             pass
 
-        assert issubclass(Candidate, BaseProtocol)  # ty:ignore[isinstance-against-protocol]
-        assert not issubclass(Candidate, DerivedProtocol)  # ty:ignore[isinstance-against-protocol]
+        assert issubclass(Candidate, BaseProtocol)
+        assert not issubclass(Candidate, DerivedProtocol)
         assert issubclass(Candidate, DerivedProtocolWithHook)
 
     def test_protocol_instancehook_must_be_declared_per_subclass(self) -> None:
         """Protocol instance hooks should mirror Protocol's subclass-hook inheritance behavior."""
 
+        @runtime_checkable
         class BaseProtocol(ProtocolRegistry, Protocol, structural_checking=False):
             @classmethod
             def __instancehook__(cls, instance: object, /) -> bool:
                 return True
 
+        @runtime_checkable
         class DerivedProtocol(BaseProtocol, Protocol):
             pass
 
+        @runtime_checkable
         class DerivedProtocolWithHook(BaseProtocol, Protocol):
             @classmethod
             def __instancehook__(cls, instance: object, /) -> bool:
@@ -1014,6 +1022,6 @@ class TestProtocolRegistryMeta:
         class Candidate:
             pass
 
-        assert isinstance(Candidate(), BaseProtocol)  # ty:ignore[isinstance-against-protocol]
-        assert not isinstance(Candidate(), DerivedProtocol)  # ty:ignore[isinstance-against-protocol]
-        assert isinstance(Candidate(), DerivedProtocolWithHook)  # ty:ignore[isinstance-against-protocol]
+        assert isinstance(Candidate(), BaseProtocol)
+        assert not isinstance(Candidate(), DerivedProtocol)
+        assert isinstance(Candidate(), DerivedProtocolWithHook)
