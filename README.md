@@ -181,9 +181,145 @@ a class does not register a cast on its own. No source argument is accepted.
 Inferred annotation names resolve against module globals and the owning class
 namespace; otherwise, pass locally scoped target types explicitly.
 
-`get_caster(source, target, graph=...)` returns the best caster without executing
-it. Like `cast`, it uses the active graph when `graph` is omitted and accepts all
-three `max_*` limits.
+#### Instance-level applicability
+
+A conversion can raise `CastUnavailable` when it does not apply to a particular
+value. `cast` tries candidate paths in order of `(cost, MRO distance, chain length)`
+until one succeeds. Other exceptions propagate immediately.
+
+```python
+from flextype.cast import CastUnavailable, cast, caster, try_cast
+
+
+@caster
+def exact_integer(value: float) -> int:
+    if not value.is_integer():
+        raise CastUnavailable("Value is not integral")
+    return int(value)
+
+
+assert cast(4.0, int) == 4
+attempt = try_cast(4.5, int)
+assert attempt is None
+```
+
+`try_cast` returns a `CastResult` with `.value` and `.caster` on success, or `None`
+when all candidates decline. The wrapper distinguishes failure from a successful
+conversion whose value is `None`, and retains the conversion's work.
+
+`get_caster(source, target, graph=...)` returns the best structural candidate
+without executing it. `iter_casters(source, target, graph=...)` lazily yields
+ranked, cycle-free candidates, retaining distinct paths through the same
+intermediate type. Search assumes that revisiting a type cannot enable a cast.
+Both APIs use the active graph when `graph` is omitted and accept all three
+inclusive `max_*` limits. The graph exposes the same methods.
+
+Calling a candidate executes that one path; it can raise `CastUnavailable`.
+`cast` and `try_cast` perform fallback. No separate predicate is needed: each
+conversion can check cheap prerequisites before doing expensive work, or decline
+after attempting it. Failed chains may already have executed earlier conversions.
+Each alternative starts from the original input and receives its own path budget;
+fallback does not roll back mutations or globally charge failed attempts.
+
+`castable(source, target)` reports structural reachability, rather than guaranteed
+success for an instance. Likewise, `Caster.compatible(value)` checks only source-type
+compatibility. Cached plans and reachability contain no instance-specific results.
+
+#### Universal casting middleware
+
+`universal_caster` registers a conversion receiving both the source value and the
+requested target type. A universal caster is a terminal delegation step: it owns
+the rest of the conversion, including any internal casts or postprocessing.
+
+```python
+from dataclasses import dataclass
+
+from flextype.cast import cast, universal_caster
+
+
+@dataclass
+class Wrapped:
+    value: object
+
+
+@universal_caster(cost=1)
+def unwrap[T](
+    value: Wrapped,
+    target: type[T],
+    *,
+    max_cost: float,
+    max_mro_distance: int,
+    max_chain_length: int,
+) -> T:
+    return cast(
+        value.value,
+        target,
+        max_cost=max_cost,
+        max_mro_distance=max_mro_distance,
+        max_chain_length=max_chain_length,
+    )
+
+
+assert cast(Wrapped(4.0), int, max_cost=1, max_chain_length=2) == 4
+```
+
+Use `@universal_caster` to infer the source, or provide it explicitly with
+`@universal_caster(Wrapped, cost=1, graph=...)`. Source unions, tuples, and generic
+origins work as with `caster`. `@universal_castmethod` registers an instance method
+with signature `(self, target, *, max_cost, max_mro_distance, max_chain_length)`;
+it infers the source from the defining class and requires no annotations.
+All forms preserve the original function. Each source has one universal
+registration, available through `graph.get_universal_caster(source)`; registering
+another replaces it. Ordinary registrations for that source can coexist.
+
+Both decorators accept `target_bound=SomeBase`, defaulting to `object`. Search
+considers a universal candidate only when
+`issubclass(requested_target, registration.target_bound)` is true. The bound itself
+and its subclasses qualify; its superclasses and unrelated targets do not.
+The bound must be a runtime type supporting `issubclass()`. The converter receives the exact requested
+target, and ineligible candidates are excluded without invoking it. For example,
+`@universal_castmethod(target_bound=str)` permits requests for `str` and its
+subclasses while allowing other routes to handle unrelated targets.
+
+The universal function raises `CastUnavailable` to decline a value or target.
+Search binds it directly to the final requested target, including unregistered
+types. It never tries universal conversions to intermediate types. Ordinary
+conversion prefixes may lead to a universal step; further conversion is delegated
+inside that step. Delegation may in turn encounter another wrapper.
+
+Nested `cast` and `try_cast` calls track active requests by graph identity, value
+identity, and target type. Re-entering the same request declines it, even with
+different budgets. Thus an `A → B` wrapper whose universal caster delegates back
+to the same `A` instance cannot endlessly restart `A → target`: the recursive
+candidate fails with `CastUnavailable`, allowing the enclosing cast to try its
+alternatives. Guard state is cleared after success or failure. Distinct nested
+wrapper instances, different targets, and delegation to another graph are allowed.
+
+`cost` declares the universal operation's **own overhead**. Its keyword budgets
+already deduct the preceding ordinary conversions and that overhead:
+
+| Forwarded budget | Deduction from the original limit |
+| --- | --- |
+| `max_cost` | Prefix cost plus universal overhead |
+| `max_mro_distance` | Prefix MRO distance plus matching the universal source |
+| `max_chain_length` | Prefix length plus one universal step |
+
+The implementation must honor these budgets, typically by forwarding them to an
+inner `cast`. Zero remaining budgets permit identity conversion. Unbounded limits
+(`float("inf")` and `sys.maxsize`) remain unbounded. An infeasible prefix or
+overhead is rejected before invoking the universal function.
+
+For **ranking**, a complete candidate ending in a universal step is charged the
+query's entire `max_cost`. Thus every finite-cost ordinary candidate precedes
+universals when no cost limit is supplied. With a finite limit, ordinary paths
+costing less than that limit come first. Equal-cost candidates use the usual MRO
+and length tie-breakers. The returned candidate's `.cost` reflects this ranking
+allowance; the universal registration's `.cost` retains its actual overhead.
+Delegated execution costs remain opaque, so competing universals cannot be
+ordered by their true total cost. Ranking allowances are never subtracted from
+the execution budget.
+
+#### Structural reachability
 
 Use `graph.get_reachable_casters(source, max_cost=..., max_mro_distance=...,
 max_chain_length=...)` to map reachable registered target types to their best
@@ -193,6 +329,10 @@ For a quick, unconstrained check, `graph.get_reachable_types(source)` returns a
 set of reachable registered target types without ranking or constructing casts.
 Pass an optional `target` to stop as soon as a compatible type is found; that
 target is included on success, but the remaining results may be incomplete.
+Enumerations remain limited to registered concrete targets even when a universal
+caster can reach unregistered types. Universal target bounds apply to both
+enumeration and targeted queries. Registration changes and virtual ABC
+registrations invalidate cached reachability and bound matches.
 
 ### Registries
 
@@ -246,9 +386,7 @@ from flextype import ProtocolRegistry, flexdispatch
 class IntList(ProtocolRegistry, structural_checking=False):
     @classmethod
     def __instancehook__(cls, instance: object, /) -> bool:
-        return isinstance(instance, list) and all(
-            isinstance(item, int) for item in instance
-        )
+        return isinstance(instance, list) and all(isinstance(item, int) for item in instance)
 
 
 @flexdispatch

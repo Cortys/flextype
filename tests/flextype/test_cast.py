@@ -3,7 +3,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import partial
-import sys
 from typing import assert_type
 
 import pytest
@@ -13,7 +12,6 @@ from flextype.cast import (
     Caster,
     CasterGraph,
     ConcreteCaster,
-    _get_dominates,
     _IdentityCaster,
     _IndirectCaster,
     cast,
@@ -45,26 +43,6 @@ def get_caster_api(request):
         yield graph, partial(get_caster, graph=graph) if request.param == "explicit_function" else get_caster
     finally:
         CASTS.reset(token)
-
-
-@pytest.mark.parametrize(("limit_mro", "limit_chain"), [(False, False), (True, False), (False, True), (True, True)])
-@pytest.mark.parametrize(
-    ("left", "right"),
-    [
-        ((0.0, 2, 3), (1.0, 1, 2)),
-        ((0.0, 2, 1), (1.0, 1, 2)),
-        ((0.0, 1, 3), (1.0, 2, 2)),
-        ((0.0, 1, 2), (1.0, 2, 3)),
-        ((1.0, 0, 0), (0.0, 1, 1)),
-        ((0.0, 1, 3), (0.0, 1, 2)),
-        ((0.0, 1, 2), (0.0, 1, 3)),
-        ((0.0, 1, 2), (0.0, 1, 2)),
-    ],
-)
-def test_specialized_dominance_matches_active_limits(left, right, limit_mro, limit_chain):
-    dominates = _get_dominates(0 if limit_mro else sys.maxsize, 0 if limit_chain else sys.maxsize)
-    expected = left <= right and (not limit_mro or left[1] <= right[1]) and (not limit_chain or left[2] <= right[2])
-    assert dominates(left, right) is expected
 
 
 def test_cheapest_chain_and_cache():
