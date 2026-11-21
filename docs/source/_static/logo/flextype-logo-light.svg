@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="flextype">
+  <title>flextype</title>
+  <g>
+    <rect x="4" y="4" width="112" height="112" rx="30" fill="#f1f1f1"/>
+    <g transform="translate(-3.5 0)">
+      <path d="M36 96V49c0-15 10-23 25-23h9v13H61c-8 0-12 4-12 11v14c4-3 10-5 16-5h10v13H66c-11 0-17 6-17 18v12Z" fill="#1A1A1A"/>
+      <circle cx="85" cy="32.5" r="9.5" fill="#4671fd"/>
+      <rect x="74" y="55.25" width="20.5" height="20.5" rx="4.5" fill="#fd4578"/>
+    </g>
+  </g>
+</svg>

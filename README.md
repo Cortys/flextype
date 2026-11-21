@@ -1,4 +1,10 @@
-# flextype
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Cortys/flextype/master/docs/source/_static/logo/flextype-logo-horizontal-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/Cortys/flextype/master/docs/source/_static/logo/flextype-logo-horizontal-light.svg">
+    <img alt="flextype" src="https://raw.githubusercontent.com/Cortys/flextype/master/docs/source/_static/logo/flextype-logo-horizontal-light.svg" width="320">
+  </picture>
+</div>
 
 `flextype` makes Python types more flexible:
 
