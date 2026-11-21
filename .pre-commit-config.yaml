@@ -3,7 +3,7 @@ repos:
     hooks:
       - id: ruff-check
         name: ruff check
-        entry: uvx ruff check --fix --exit-non-zero-on-fix --no-cache
+        entry: uv run --locked --group lint ruff check --fix --exit-non-zero-on-fix --no-cache
         language: system
         types_or: [python, pyi]
         files: ^(src/flextype|tests/flextype)/.*\.py$

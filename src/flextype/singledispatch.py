@@ -5,11 +5,13 @@ from __future__ import annotations
 from abc import ABCMeta
 from contextlib import suppress
 from functools import singledispatch, update_wrapper
-from typing import TYPE_CHECKING, Any, SupportsIndex, get_args, overload, override
+from typing import TYPE_CHECKING, Any, SupportsIndex, overload, override
 
+from flextype.annotations import try_unwrap_types, unwrap_first_arg
+from flextype.cast import CASTS
 from flextype.isinstance import (
+    _UNRESOLVED,
     LazyType,
-    _is_union_type,
     _module_name_precheck,
     _resolve_loaded_type,
     _split_lazy_type,
@@ -22,15 +24,9 @@ if TYPE_CHECKING:
 type RegistrationFunction = Callable[[type], Any]
 
 
-def is_valid_dispatch_type(cls: LazyType) -> bool:
-    """Check if cls is a valid dispatch type."""
-    if isinstance(cls, (type, str)):
-        return True
-    if isinstance(cls, tuple):
-        return all(is_valid_dispatch_type(c) for c in cls)
-    if _is_union_type(cls):
-        return all(is_valid_dispatch_type(c) for c in get_args(cls))
-    return False
+def is_valid_dispatch_type(cls: object) -> bool:
+    """Check if cls is a valid dispatch type annotation."""
+    return try_unwrap_types(cls, allow_strings=True) is not None
 
 
 def first_argument[T](x: T, *args: Any, **kwargs: Any) -> T:  # noqa: ANN401, ARG001
@@ -57,6 +53,12 @@ class Flexdispatch[**In, Out]:
     __slots__ = (
         "__dict__",
         "__weakref__",
+        "_autocast",
+        "_autocast_max_chain_length",
+        "_autocast_max_cost",
+        "_autocast_max_mro_distance",
+        "_autocast_targets",
+        "_default_func",
         "_parse_annotations",
         "_pending_delayed_module_check",
         "_pending_delayed_modules",
@@ -76,16 +78,25 @@ class Flexdispatch[**In, Out]:
         self,
         func: Callable[In, Out] | None = None,
         *,
-        dispatch_on: Callable[In, Any] = first_argument,
+        # __call__ enforces a first positional argument for the default extractor.
+        dispatch_on: Callable[In, Any] = first_argument,  # ty: ignore[invalid-parameter-default]
         parse_annotations: bool = True,
+        autocast: bool = False,
+        max_cost: float = float("inf"),
+        max_mro_distance: int = 0,
+        max_chain_length: int = 1,
     ) -> None:
         """Initialize the lazy_singledispatch instance."""
         if func is None:
             msg = "func must be provided"
             raise ValueError(msg)
+        if autocast and dispatch_on is not first_argument:
+            msg = "autocast is only supported with default first-argument dispatch."
+            raise ValueError(msg)
         update_wrapper(self, func, updated=())
 
         self._singledispatcher = singledispatch(func)
+        self._default_func: Callable = func
         self.funcname = getattr(func, "__name__", "singledispatch function")
         self.string_registry: dict[str, Callable] = {}
         self.delayed_string_registration_registry: dict[str, RegistrationFunction] = {}
@@ -93,6 +104,11 @@ class Flexdispatch[**In, Out]:
         self.registry_meta_types: set[RegistryMeta] = set()
         self.dispatch_on: Callable[In, Any] = dispatch_on
         self._parse_annotations = parse_annotations
+        self._autocast = autocast
+        self._autocast_max_cost = max_cost
+        self._autocast_max_mro_distance = max_mro_distance
+        self._autocast_max_chain_length = max_chain_length
+        self._autocast_targets: tuple[type, ...] | None = None
         self._pending_modules: set[str] = set()
         self._pending_module_check = _module_name_precheck(self._pending_modules)
         self._pending_delayed_modules: set[str] = set()
@@ -102,17 +118,32 @@ class Flexdispatch[**In, Out]:
             with suppress(TypeError):
                 self._types_by_func.setdefault(registered_func, set()).add(registered_type)
 
+    def _get_autocast_targets(self) -> tuple[type, ...]:
+        """Return cached non-object target types from eager and delayed registries."""
+        targets = self._autocast_targets
+        if targets is None:
+            targets = tuple(
+                dict.fromkeys(
+                    t
+                    for t in (*self._singledispatcher.registry, *self.delayed_registration_registry)
+                    if t is not object
+                )
+            )
+            self._autocast_targets = targets
+        return targets
+
     def _resolve_pending_registrations(self) -> None:
         """Promote available handlers in one pass, after delayed callbacks."""
         pending_modules: set[str] = set()
         for name, func in tuple(self.string_registry.items()):
             unloaded: set[str] = set()
             resolved = _resolve_loaded_type(name, unloaded)
-            if isinstance(resolved, type):
-                del self.string_registry[name]
-                self._eager_register((resolved,), func)
-            else:
+            if resolved is _UNRESOLVED:
                 pending_modules.update(unloaded)
+            else:
+                del self.string_registry[name]
+                if isinstance(resolved, type):
+                    self._eager_register((resolved,), func)
         self._pending_modules = pending_modules
         self._pending_module_check = _module_name_precheck(self._pending_modules)
 
@@ -123,11 +154,13 @@ class Flexdispatch[**In, Out]:
         for target, func in tuple(registry.items()):
             unloaded: set[str] = set()
             resolved = _resolve_loaded_type(target, unloaded)
-            if isinstance(resolved, type):
-                del registry[target]
-                self.delayed_registration_registry[resolved] = func
-            else:
+            if resolved is _UNRESOLVED:
                 pending_modules.update(unloaded)
+            else:
+                del registry[target]
+                if isinstance(resolved, type):
+                    self.delayed_registration_registry[resolved] = func
+                    self._autocast_targets = None
         self._pending_delayed_modules = pending_modules
         self._pending_delayed_module_check = _module_name_precheck(pending_modules)
 
@@ -160,6 +193,7 @@ class Flexdispatch[**In, Out]:
                         registration_func(cls)
                     for t in active_registrations:
                         delayed_registration_registry.pop(t, None)
+                    self._autocast_targets = None
 
         if self.string_registry and self._pending_module_check():
             self._resolve_pending_registrations()
@@ -249,6 +283,8 @@ class Flexdispatch[**In, Out]:
                 union_type |= t
             self._singledispatcher.register(union_type, func)
         for t in types:
+            if t is object:
+                self._default_func = func
             if isinstance(t, RegistryMeta):
                 self.registry_meta_types.add(t)
 
@@ -268,123 +304,103 @@ class Flexdispatch[**In, Out]:
             with suppress(TypeError):
                 self._types_by_func.setdefault(func, set()).add(t)
 
+        self._autocast_targets = None
         return func
 
-    def register(self, cls: LazyType | Callable, func: Callable | None = None) -> Callable:  # noqa: PLR0912
-        """Register a new implementation for the given type or string."""
-        if is_valid_dispatch_type(cls):  # ty: ignore[invalid-argument-type]
-            if func is None:
-                return lambda f: self.register(cls, f)
-        else:
+    def register(self, cls: object, func: Callable | None = None) -> Callable:
+        """Register a new implementation for the given type or annotation."""
+        unwrapped = try_unwrap_types(cls, allow_strings=True)
+        if unwrapped is None:
             if func is not None:
-                msg = f"Invalid first argument to `register()`. {cls!r} is not a class, string, tuple or union type."
+                msg = f"Invalid first argument to `register()`. {cls!r} is not a valid type annotation."
                 raise TypeError(msg)
-            ann = getattr(cls, "__annotations__", {})
-            if not ann:
-                msg = (
-                    f"Invalid first argument to `register()`: {cls!r}. "
-                    f"Use either `@register(some_class)` or plain `@register` "
-                    f"on an annotated function."
-                )
-                raise TypeError(msg)
+            unwrapped = unwrap_first_arg(
+                cls, parse_annotations=self._parse_annotations, allow_strings=True, decorator_name="register"
+            )
             func = cls  # ty: ignore[invalid-assignment]
 
-            if self._parse_annotations:
-                # Only parse and dereference string annotations when not in lazy dispatch mode.
-                from typing import get_type_hints  # noqa: PLC0415
+        def decorate(target_func: Callable) -> Callable:
+            if len(unwrapped) == 1 and isinstance(unwrapped[0], type):
+                if self.string_registry and self._pending_module_check():
+                    self._resolve_pending_registrations()
+                return self._eager_register((unwrapped[0],), target_func)
+            pending_modules: set[str] = set()
+            types, strings = _split_lazy_type(unwrapped, pending_modules)
+            if types:
+                if self.string_registry and self._pending_module_check():
+                    self._resolve_pending_registrations()
+                self._eager_register(tuple(types), target_func)
+            if strings:
+                for s in strings:
+                    self.string_registry.pop(s, None)
+                    self.string_registry[s] = target_func
+                self._pending_modules.update(pending_modules)
+                self._pending_module_check = _module_name_precheck(self._pending_modules)
+            return target_func
 
-                argname, cls = next(iter(get_type_hints(func).items()))
-            else:
-                argname, cls = next(iter(func.__annotations__.items()))
-                if not is_valid_dispatch_type(cls):  # type: ignore[arg-type]
-                    if _is_union_type(cls) or isinstance(cls, tuple):
-                        msg = f"Invalid annotation for {argname!r}. {cls!r} not all arguments are classes or strings."
-                        raise TypeError(msg)
-                    msg = f"Invalid annotation for {argname!r}. {cls!r} is not a class or string."
-                    raise TypeError(msg)
-
-        if self.string_registry and self._pending_module_check():
-            self._resolve_pending_registrations()
-        pending_modules: set[str] = set()
-        types, strings = _split_lazy_type(cls, pending_modules)  # ty: ignore[invalid-argument-type]
-
-        if types:
-            self._eager_register(tuple(types), func)  # ty:ignore[invalid-argument-type]
-
-        if len(strings) > 0:
-            for s in strings:
-                self.string_registry[s] = func  # ty: ignore[invalid-assignment]
-            self._pending_modules.update(pending_modules)
-            self._pending_module_check = _module_name_precheck(self._pending_modules)
-
-        return func  # ty: ignore[invalid-return-type]
-
-    @overload
-    def delayed_register(self, cls: LazyType) -> Callable[[RegistrationFunction], RegistrationFunction]: ...
+        return decorate if func is None else decorate(func)
 
     @overload
     def delayed_register(self, cls: RegistrationFunction) -> RegistrationFunction: ...
 
     @overload
-    def delayed_register(self, cls: LazyType, func: RegistrationFunction) -> RegistrationFunction: ...
+    def delayed_register(self, cls: LazyType | object) -> Callable[[RegistrationFunction], RegistrationFunction]: ...
 
-    def delayed_register(  # noqa: PLR0912
+    @overload
+    def delayed_register(self, cls: LazyType | object, func: RegistrationFunction) -> RegistrationFunction: ...
+
+    def delayed_register(
         self,
-        cls: LazyType | RegistrationFunction,
+        cls: object,
         func: RegistrationFunction | None = None,
     ) -> RegistrationFunction | Callable[[RegistrationFunction], RegistrationFunction]:
         """Register a delayed registration function."""
-        if is_valid_dispatch_type(cls):  # ty: ignore[invalid-argument-type]
-            if func is None:
-                return lambda f: self.delayed_register(cls, f)  # ty: ignore[invalid-argument-type]
-        else:
+        unwrapped = try_unwrap_types(cls, allow_strings=True)
+        if unwrapped is None:
             if func is not None:
-                msg = (
-                    f"Invalid first argument to `delayed_register()`. "
-                    f"{cls!r} is not a class, string, tuple or union type."
-                )
+                msg = f"Invalid first argument to `delayed_register()`. {cls!r} is not a valid type annotation."
                 raise TypeError(msg)
-            ann = getattr(cls, "__annotations__", {})
-            if not ann:
-                msg = (
-                    f"Invalid first argument to `delayed_register()`: {cls!r}. "
-                    f"Use either `@delayed_register(some_class)` or plain `@delayed_register` "
-                    f"on an annotated function."
-                )
-                raise TypeError(msg)
+            unwrapped = unwrap_first_arg(
+                cls, parse_annotations=self._parse_annotations, allow_strings=True, decorator_name="delayed_register"
+            )
             func = cls  # ty: ignore[invalid-assignment]
 
-            if self._parse_annotations:
-                # Only parse and dereference string annotations when not in lazy dispatch mode.
-                from typing import get_type_hints  # noqa: PLC0415
+        def decorate(target_func: RegistrationFunction) -> RegistrationFunction:
+            pending_modules: set[str] = set()
+            types, strings = _split_lazy_type(unwrapped, pending_modules)
+            if types:
+                if self.string_registry and self._pending_module_check():
+                    self._resolve_pending_registrations()
+                if self.delayed_string_registration_registry and self._pending_delayed_module_check():
+                    self._resolve_pending_delayed_registrations()
+                for t in types:
+                    self.delayed_registration_registry[t] = target_func
+                self._autocast_targets = None
+            if strings:
+                for s in strings:
+                    self.delayed_string_registration_registry.pop(s, None)
+                    self.delayed_string_registration_registry[s] = target_func
+                self._pending_delayed_modules.update(pending_modules)
+                self._pending_delayed_module_check = _module_name_precheck(self._pending_delayed_modules)
+            return target_func
 
-                argname, cls = next(iter(get_type_hints(func).items()))
-            else:
-                argname, cls = next(iter(func.__annotations__.items()))
-                if not is_valid_dispatch_type(cls):  # type: ignore[arg-type]
-                    if _is_union_type(cls) or isinstance(cls, tuple):
-                        msg = f"Invalid annotation for {argname!r}. {cls!r} not all arguments are classes or strings."
-                        raise TypeError(msg)
-                    msg = f"Invalid annotation for {argname!r}. {cls!r} is not a class or string."
-                    raise TypeError(msg)
+        return decorate if func is None else decorate(func)
 
-        if self.string_registry and self._pending_module_check():
-            self._resolve_pending_registrations()
-        if self.delayed_string_registration_registry and self._pending_delayed_module_check():
-            self._resolve_pending_delayed_registrations()
-        pending_modules: set[str] = set()
-        types, strings = _split_lazy_type(cls, pending_modules)  # ty: ignore[invalid-argument-type]
-
-        for t in types:
-            self.delayed_registration_registry[t] = func  # ty: ignore[invalid-assignment]
-
-        if len(strings) > 0:
-            for s in strings:
-                self.delayed_string_registration_registry[s] = func  # ty: ignore[invalid-assignment]
-            self._pending_delayed_modules.update(pending_modules)
-            self._pending_delayed_module_check = _module_name_precheck(self._pending_delayed_modules)
-
-        return func  # ty: ignore[invalid-return-type]
+    def _is_explicit_default_match(self, value: object) -> bool:
+        """Return whether the default handler also matched via a non-object registration."""
+        try:
+            default_types = self._types_by_func.get(self._default_func)
+        except TypeError:
+            default_types = {
+                t
+                for t, registered_func in self._singledispatcher.registry.items()
+                if registered_func is self._default_func
+            }
+        return (
+            default_types is not None
+            and len(default_types) > 1
+            and any(t is not object and isinstance(value, t) for t in default_types)
+        )
 
     def __call__(self, *args: In.args, **kwargs: In.kwargs) -> Out:
         """Call the appropriate registered function based on the type of the first argument."""
@@ -393,10 +409,28 @@ class Flexdispatch[**In, Out]:
             raise TypeError(msg)
         dispatch_on = self.dispatch_on
         dispatch_value = args[0] if dispatch_on is first_argument else dispatch_on(*args, **kwargs)  # ty:ignore[invalid-argument-type]
-        return self.dispatch(
+        func = self.dispatch(
             dispatch_value.__class__,
             registry_meta_lookup=dispatch_value,
-        )(*args, **kwargs)
+        )
+        if self._autocast and func is self._default_func and not self._is_explicit_default_match(dispatch_value):
+            targets = self._get_autocast_targets()
+            if targets:
+                casted = CASTS.get().cast(
+                    dispatch_value,
+                    targets,
+                    default=dispatch_value,
+                    max_cost=self._autocast_max_cost,
+                    max_mro_distance=self._autocast_max_mro_distance,
+                    max_chain_length=self._autocast_max_chain_length,
+                )
+                if casted is not dispatch_value:
+                    func = self.dispatch(
+                        casted.__class__,
+                        registry_meta_lookup=casted,
+                    )
+                    return func(casted, *args[1:], **kwargs)
+        return func(*args, **kwargs)
 
     @override
     def __reduce_ex__(self, protocol: SupportsIndex | None = None) -> tuple[object, tuple[str, str]]:
@@ -432,6 +466,10 @@ def flexdispatch[**In, Out](
     *,
     dispatch_on: Callable = first_argument,
     parse_annotations: bool = True,
+    autocast: bool = False,
+    max_cost: float = float("inf"),
+    max_mro_distance: int = 0,
+    max_chain_length: int = 1,
 ) -> Flexdispatch[In, Out]: ...
 
 
@@ -440,6 +478,10 @@ def flexdispatch[**In, Out](
     *,
     dispatch_on: Callable = first_argument,
     parse_annotations: bool = True,
+    autocast: bool = False,
+    max_cost: float = float("inf"),
+    max_mro_distance: int = 0,
+    max_chain_length: int = 1,
 ) -> Callable[[Callable[In, Out]], Flexdispatch[In, Out]]: ...
 
 
@@ -448,6 +490,10 @@ def flexdispatch[**In, Out](
     *,
     dispatch_on: Callable = first_argument,
     parse_annotations: bool = True,
+    autocast: bool = False,
+    max_cost: float = float("inf"),
+    max_mro_distance: int = 0,
+    max_chain_length: int = 1,
 ) -> Flexdispatch[In, Out] | Callable[[Callable[In, Out]], Flexdispatch[In, Out]]:
     """Create a new lazy_singledispatch or return a decorator."""
     if func is None:
@@ -457,6 +503,10 @@ def flexdispatch[**In, Out](
                 func,
                 dispatch_on=dispatch_on,
                 parse_annotations=parse_annotations,
+                autocast=autocast,
+                max_cost=max_cost,
+                max_mro_distance=max_mro_distance,
+                max_chain_length=max_chain_length,
             )
 
         return decorator
@@ -465,4 +515,8 @@ def flexdispatch[**In, Out](
         func,
         dispatch_on=dispatch_on,
         parse_annotations=parse_annotations,
+        autocast=autocast,
+        max_cost=max_cost,
+        max_mro_distance=max_mro_distance,
+        max_chain_length=max_chain_length,
     )

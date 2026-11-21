@@ -1,6 +1,29 @@
 """Lazy alternatives to singledispatch and isinstance."""
 
 from . import registry_pickle
+from .annotations import TypeUnwrapper, register_type_unwrapper, try_unwrap_types, unwrap_types
+from .autocast import autocast
+from .cast import (
+    Caster,
+    CasterGraph,
+    CastFailure,
+    CastLimits,
+    CastResult,
+    CastTarget,
+    CastUnavailable,
+    CastUnavailableGroup,
+    ConcreteCaster,
+    UniversalCaster,
+    UniversalCastFn,
+    cast,
+    caster,
+    castmethod,
+    iter_casters,
+    reachable,
+    try_cast,
+    universal_caster,
+    universal_castmethod,
+)
 from .isinstance import LazyType, lazy_isinstance, lazy_issubclass
 from .load import lazy_callable, lazy_import
 from .registry_meta import (
@@ -17,6 +40,15 @@ from .singledispatch import Flexdispatch, flexdispatch, is_valid_dispatch_type
 from .switchdispatch import switch, switchdispatch
 
 __all__ = [
+    "CastFailure",
+    "CastLimits",
+    "CastResult",
+    "CastTarget",
+    "CastUnavailable",
+    "CastUnavailableGroup",
+    "Caster",
+    "CasterGraph",
+    "ConcreteCaster",
     "Flexdispatch",
     "LazyType",
     "ProtocolRegistry",
@@ -24,16 +56,31 @@ __all__ = [
     "RegistrationError",
     "Registry",
     "RegistryMeta",
+    "TypeUnwrapper",
+    "UniversalCastFn",
+    "UniversalCaster",
     "annotator",
+    "autocast",
+    "cast",
+    "caster",
+    "castmethod",
     "copy_explicit_registry_classes",
     "flexdispatch",
     "get_explicit_registry_classes",
     "is_valid_dispatch_type",
+    "iter_casters",
     "lazy_callable",
     "lazy_import",
     "lazy_isinstance",
     "lazy_issubclass",
+    "reachable",
+    "register_type_unwrapper",
     "registry_pickle",
     "switch",
     "switchdispatch",
+    "try_cast",
+    "try_unwrap_types",
+    "universal_caster",
+    "universal_castmethod",
+    "unwrap_types",
 ]

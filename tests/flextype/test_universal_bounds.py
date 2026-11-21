@@ -59,8 +59,8 @@ def test_universal_receives_exact_targets_within_its_bound(target, method):
 
 
 @pytest.mark.parametrize("target", [Parent, Unrelated])
-@pytest.mark.parametrize("warm_with", [None, "get_reachable_types", "get_reachable_casters"])
-def test_ineligible_targets_are_never_queued_or_executed(target, warm_with):
+@pytest.mark.parametrize("warm", [False, True])
+def test_ineligible_targets_are_never_queued_or_executed(target, warm):
     graph = CasterGraph()
     caster(list, Child, lambda _: Child(), graph=graph)
 
@@ -68,18 +68,17 @@ def test_ineligible_targets_are_never_queued_or_executed(target, warm_with):
     def forbidden(_value, _target, **_limits: object):
         pytest.fail("A universal caster must never receive a target outside its bound")
 
-    if warm_with is not None:
-        assert set(getattr(graph, warm_with)(Source)) == {Child}
-    assert not graph.castable(Source, target)
-    assert not graph.castable(Source, target, max_cost=1)
+    if warm:
+        assert graph.reachable(Source, Child)
+    assert not graph.reachable(Source, target)
+    assert not graph.reachable(Source, target, max_cost=1)
     assert list(graph.iter_casters(Source, target)) == []
     assert graph.try_cast(Source(), target) is None
     with pytest.raises(CastUnavailable):
-        graph.get_caster(Source, target)
+        graph.cast(Source(), target)
 
 
-@pytest.mark.parametrize("warm_with", ["get_reachable_types", "get_reachable_casters"])
-def test_reachability_combines_ordinary_targets_and_all_reachable_bounds(warm_with):
+def test_reachability_combines_ordinary_targets_and_all_reachable_bounds():
     class First:
         pass
 
@@ -99,14 +98,11 @@ def test_reachability_combines_ordinary_targets_and_all_reachable_bounds(warm_wi
         return target()
 
     expected = {First, Second, Child, Unrelated}
-    assert set(getattr(graph, warm_with)(Source)) == expected
-    assert graph.get_reachable_types(Source) == expected
-    assert set(graph.get_reachable_casters(Source)) == expected
-    assert not graph.castable(Source, Parent)
+    assert all(graph.reachable(Source, target) for target in expected)
+    assert not graph.reachable(Source, Parent)
     assert isinstance(graph.cast(Source(), Child), Child)
     assert isinstance(graph.cast(Source(), Unrelated), Unrelated)
-    assert graph.get_reachable_types(Source, Bound) == expected | {Bound}
-    assert graph.reachable_types[Source] == expected
+    assert graph.reachable(Source, Bound)
 
 
 @pytest.mark.parametrize("warm", [False, True])
@@ -124,12 +120,13 @@ def test_terminal_bounded_result_does_not_hide_an_ordinary_upcast(warm):
         return target()
 
     if warm:
-        graph.get_reachable_types(Source)
-    reachable = graph.get_reachable_casters(Source, max_cost=1)
-    assert set(reachable) == {Intermediate, Child, Parent}
-    assert reachable[Child] == graph.get_caster(Source, Child, max_cost=1)
-    assert reachable[Parent] == graph.get_caster(Source, Parent, max_cost=1)
-    assert isinstance(reachable[Parent](Source()), Child)
+        assert graph.reachable(Source, Child)
+    assert graph.reachable(Source, Parent, max_cost=1)
+    routes = list(graph.iter_casters(Source, Parent, max_cost=1))
+    assert len(routes) == 1
+    assert routes[0].target is Child
+    assert isinstance(routes[0](Source()), Child)
+    assert len(list(graph.iter_casters(Source, Child, max_cost=1))) == 2
 
 
 def test_ineligible_universal_does_not_block_ordinary_conversions():
@@ -142,11 +139,9 @@ def test_ineligible_universal_does_not_block_ordinary_conversions():
 
     assert graph.cast(Source(), str) == "ordinary"
     assert len(list(graph.iter_casters(Source, str))) == 1
-    assert graph.get_reachable_types(Source) == {str}
 
 
-@pytest.mark.parametrize("warm_with", ["get_reachable_types", "get_reachable_casters"])
-def test_abc_registration_invalidates_cached_bound_rejections(warm_with):
+def test_abc_registration_invalidates_cached_bound_rejections():
     class Marker(metaclass=ABCMeta):  # noqa: B024 - A registration-only marker.
         pass
 
@@ -157,13 +152,10 @@ def test_abc_registration_invalidates_cached_bound_rejections(warm_with):
     def convert(_value, target, **_limits: object):
         return target()
 
-    assert set(getattr(graph, warm_with)(Source)) == set()
-    assert not graph.castable(Source, Child)
+    assert not graph.reachable(Source, Child)
     assert list(graph.iter_casters(Source, Child)) == []
     Marker.register(Child)
-    assert graph.castable(Source, Child)
-    assert graph.get_reachable_types(Source) == {Child}
-    assert set(graph.get_reachable_casters(Source)) == {Child}
+    assert graph.reachable(Source, Child)
     assert isinstance(graph.cast(Source(), Child), Child)
 
 
@@ -176,10 +168,8 @@ def test_changing_bounds_invalidates_both_positive_and_negative_caches(before, a
     def convert(_value, target, **_limits: object):
         return target()
 
-    assert graph.castable(Source, bytes) is (before is object)
+    assert graph.reachable(Source, bytes) is (before is object)
     list(graph.iter_casters(Source, bytes))
-    graph.get_reachable_types(Source)
     universal_caster(Source, convert, target_bound=after, graph=graph)
-    assert graph.castable(Source, bytes) is (after is object)
-    assert graph.get_reachable_types(Source) == ({bytes} if after is object else set())
+    assert graph.reachable(Source, bytes) is (after is object)
     assert len(list(graph.iter_casters(Source, bytes))) == int(after is object)

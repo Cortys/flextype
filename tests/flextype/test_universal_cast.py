@@ -57,12 +57,10 @@ def test_search_does_not_call_universal_functions():
     def forbidden(_value, _target, **_limits: object):
         pytest.fail("Structural searches must not invoke a universal caster")
 
-    assert graph.get_caster(Wrapped, str).cost == float("inf")
+    assert next(graph.iter_casters(Wrapped, str)).cost == float("inf")
     assert len(list(graph.iter_casters(Wrapped, str))) == 1
-    assert graph.castable(Wrapped, str)
-    assert graph.castable(Wrapped, str, max_cost=0)
-    assert graph.get_reachable_types(Wrapped) == set()
-    assert graph.get_reachable_casters(Wrapped) == {}
+    assert graph.reachable(Wrapped, str)
+    assert graph.reachable(Wrapped, str, max_cost=0)
 
 
 def test_universal_is_bound_only_to_the_final_target():
@@ -77,7 +75,7 @@ def test_universal_is_bound_only_to_the_final_target():
             return float(value.value)
         raise CastUnavailable
 
-    assert graph.castable(Wrapped, str)
+    assert graph.reachable(Wrapped, str)
     assert graph.try_cast(Wrapped(4), str) is None
     assert targets == [str]
     assert len(list(graph.iter_casters(Wrapped, str))) == 1
@@ -172,7 +170,7 @@ def test_infeasible_overhead_is_rejected_without_execution(limits):
     def forbidden(_value, _target, **_remaining: object):
         pytest.fail("An infeasible universal invocation must not execute")
 
-    assert not graph.castable(Child, str, **limits)
+    assert not graph.reachable(Child, str, **limits)
     assert list(graph.iter_casters(Child, str, **limits)) == []
     assert graph.try_cast(Child(4), str, **limits) is None
 
@@ -230,9 +228,9 @@ def test_limited_and_cached_casters_keep_independent_bound_budgets():
         calls.append((target, limits))
         return target(value.value)
 
-    unlimited = graph.get_caster(Child, str)
-    limited = graph.get_caster(Child, str, max_cost=7, max_mro_distance=3, max_chain_length=2)
-    tighter = graph.get_caster(Child, str, max_cost=3, max_mro_distance=1, max_chain_length=1)
+    unlimited = next(graph.iter_casters(Child, str))
+    limited = next(graph.iter_casters(Child, str, max_cost=7, max_mro_distance=3, max_chain_length=2))
+    tighter = next(graph.iter_casters(Child, str, max_cost=3, max_mro_distance=1, max_chain_length=1))
     assert unlimited.cost == float("inf")
     assert limited.cost == 7
     assert tighter.cost == 3
@@ -244,11 +242,10 @@ def test_limited_and_cached_casters_keep_independent_bound_budgets():
         (str, {"max_cost": 1, "max_mro_distance": 0, "max_chain_length": 0}),
         (str, {"max_cost": float("inf"), "max_mro_distance": sys.maxsize, "max_chain_length": sys.maxsize}),
     ]
-    assert graph.get_cached_caster(Child, str) is unlimited
+    assert next(graph.iter_casters(Child, str)) is unlimited
 
 
-@pytest.mark.parametrize("warm_with", ["get_reachable_casters", "get_reachable_types"])
-def test_finite_reachability_cache_does_not_exclude_unregistered_targets(warm_with):
+def test_finite_reachability_cache_does_not_exclude_unregistered_targets():
     graph = CasterGraph()
     caster(int, Wrapped, Wrapped, graph=graph)
     caster(list, str, str, graph=graph)
@@ -257,10 +254,8 @@ def test_finite_reachability_cache_does_not_exclude_unregistered_targets(warm_wi
     def convert(value, target, **_limits: object):
         return target(value.value)
 
-    assert set(getattr(graph, warm_with)(int)) == {Wrapped, str}
-    assert graph.get_reachable_types(int, bytes) == {Wrapped, str, bytes}
-    assert graph.reachable_types[int] == {Wrapped, str}
-    assert graph.castable(int, bytes)
+    assert graph.reachable(int, str)
+    assert graph.reachable(int, bytes)
     assert graph.cast(2, bytes) == b"\x00\x00"
 
 
@@ -281,30 +276,28 @@ def test_reachable_universal_casters_bind_each_requested_type_exactly():
         calls.append(target)
         return target()
 
-    reachable = graph.get_reachable_casters(Wrapped)
-    assert set(reachable) == {Base, Child}
-    assert reachable[Base] == graph.get_caster(Wrapped, Base)
-    assert reachable[Child] == graph.get_caster(Wrapped, Child)
-    assert type(reachable[Base](Wrapped(None))) is Base
-    assert type(reachable[Child](Wrapped(None))) is Child
-    assert calls == [Base, Child]
+    candidates = list(graph.iter_casters(Wrapped, (Base, Child)))
+    assert [candidate.target for candidate in candidates] == [Child, Base]
+    assert calls == []
+    assert [type(candidate(Wrapped(None))) for candidate in candidates] == [Child, Base]
+    assert calls == [Child, Base]
 
 
 def test_registering_a_universal_invalidates_cached_misses_and_best_paths():
     graph = CasterGraph()
     caster(int, Wrapped, Wrapped, graph=graph)
-    assert graph.get_reachable_types(int) == {Wrapped}
-    assert not graph.castable(int, str)
+    assert graph.reachable(int, Wrapped)
+    assert not graph.reachable(int, str)
 
     @universal_caster(Wrapped, graph=graph)
     def convert(_value, _target, **_limits: object):
         return "universal"
 
     assert graph.cast(4, str) == "universal"
-    selected = graph.get_caster(int, str)
+    selected = next(graph.iter_casters(int, str))
     caster(Wrapped, str, lambda _: "ordinary", cost=1, graph=graph)
     assert graph.cast(4, str) == "ordinary"
-    assert graph.get_caster(int, str) is not selected
+    assert next(graph.iter_casters(int, str)) is not selected
 
 
 def test_virtual_target_registration_invalidates_a_cached_universal():
@@ -321,9 +314,9 @@ def test_virtual_target_registration_invalidates_a_cached_universal():
     def convert(_value, _target, **_limits: object):
         return Target()
 
-    assert graph.get_caster(int, Target).cost == float("inf")
+    assert next(graph.iter_casters(int, Target)).cost == float("inf")
     Target.register(Actual)
-    assert graph.get_caster(int, Target).cost == 0
+    assert next(graph.iter_casters(int, Target)).cost == 0
     assert isinstance(graph.cast(4, Target), Actual)
 
 
@@ -341,7 +334,7 @@ def test_virtual_universal_source_does_not_supply_nominal_mro_edges():
     def forbidden(_value, _target, **_limits: object):
         pytest.fail("Virtual ABC membership must not introduce MRO sources")
 
-    assert not graph.castable(Actual, str)
+    assert not graph.reachable(Actual, str)
     assert graph.try_cast(Actual(), str) is None
 
 

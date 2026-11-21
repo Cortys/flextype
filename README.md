@@ -1,89 +1,52 @@
 # flextype
 
-`flextype` makes working with types in Python more flexible.
-It provides primitives for writing code with conditional dispatch paths for optional dependencies.
+`flextype` makes Python types more flexible:
 
-Additionally, it extends the idea of dynamic subclass registrations provided by `abc.ABCMeta` to the instance-level, enabling the definition of types with dynamically defined instance sets.
-This is useful to define marker types, enabling conditional dispatch of objects to different implementations based on those marker types.
-
+- **Lazy type checks & dispatch** (`lazy_isinstance`, `flexdispatch`): match types by name without importing optional dependencies.
+- **Ranked casting & autocasting** (`cast`, `autocast`, `flexdispatch(autocast=True)`): chain conversions, decline values dynamically, and refine objects automatically.
+- **Instance-level registries** (`ProtocolRegistry`, `Registry`): classify individual objects dynamically without altering their inheritance hierarchy.
 
 ## Install
 
-`flextype` requires Python 3.12 or newer.
+Requires Python 3.12+.
 
 ```sh
 pip install flextype
-```
-
-```sh
+# or
 uv add flextype
 ```
 
-## Quickstart
+## Lazy Type Checking
 
-### Lazy Type Checking
-
-`lazy_isinstance` and `lazy_issubclass` work like `isinstance` and
-`issubclass`, but type references may be real classes, fully qualified string
-names, unions, or tuples. String references are resolved through `sys.modules`
-and normal attribute lookup, supporting aliases, nested classes and dynamic
-attributes. The resolver does not import missing modules. Unloaded module
-references do not match.
-Resolved references use regular `isinstance` / `issubclass` semantics, including
-virtual subclasses and custom checking hooks, which may also have side effects.
-
-Use `"pkg.submodule:Outer.Type"` to specify the module boundary explicitly.
-Resolution waits only for that module; once it is loaded, missing attributes
-raise `AttributeError`. Dotted references such as `"pkg.submodule.Type"` use the
-longest loaded module prefix, even when a shorter module exposes a different
-nested attribute. If lookup fails, they wait only when a longer module prefix
-could still load. Thus `"pkg.C"` raises if `pkg` is loaded but lacks `C`.
-
-Lazy and delayed dispatcher registrations follow the same rules. Once a
-reference resolves to a class, later imports do not retarget that registration.
+`lazy_isinstance` and `lazy_issubclass` work like `isinstance` and `issubclass`,
+but also accept dotted strings, explicit `"module:QualName"` strings, tuples, and
+unions. Missing modules are never imported and simply do not match.
 
 ```python
 from pathlib import Path
 
 from flextype import lazy_isinstance, lazy_issubclass
 
-
 path = Path("README.md")
 
 assert lazy_isinstance(path, "pathlib.Path")
+assert lazy_isinstance(path, "pathlib:Path")
 assert lazy_isinstance(path, (Path, "os.PathLike"))
 assert lazy_issubclass(type(path), ("pathlib.Path", str))
+assert not lazy_isinstance(path, "not_installed_pkg.Thing")
 ```
 
-### `flexdispatch`
+Once a referenced module *is* loaded, normal `isinstance`/`issubclass` rules
+apply (including virtual ABCs), and missing attributes raise `AttributeError`.
 
-`flexdispatch` is a lazy alternative to `functools.singledispatch`. It accepts
-regular registrations, lazy string registrations, and delayed registrations.
+## `flexdispatch`
 
-```python
-from flextype import flexdispatch
-
-
-@flexdispatch
-def render(value: object) -> str:
-    return "object"
-
-
-@render.register("pathlib.Path")
-def render_path(value: object) -> str:
-    return f"path: {value}"
-```
-
-String registrations are resolved lazily. In the example above, `pathlib.Path`
-is converted into the real class only after a matching value is dispatched.
-
-Delayed registrations are useful when the implementation itself lives in an
-optional integration module. Register a callback against a lazy type name, then
-import the module that defines the regular registrations only when that type is
-first encountered.
+`flexdispatch` is a lazy alternative to `functools.singledispatch` that supports
+string type names and on-demand handler loading.
 
 ```python
-# myapp/render.py
+from pathlib import Path
+
 from flextype import flexdispatch
 
 
@@ -92,73 +55,48 @@ def render(value: object) -> str:
     return repr(value)
 
 
+@render.register("pathlib.Path")
+def render_path(value: object) -> str:
+    return f"path: {value}"
+
+
+assert render(Path("README.md")) == "path: README.md"
+assert render(42) == "42"
+```
+
+Use `delayed_register` when the handler itself lives in an optional integration
+module—it imports that module only when a matching type is first dispatched:
+
+```python
+# myapp/render.py
 @render.delayed_register("pandas.DataFrame")
-def _load_pandas_handlers(seen_type: type) -> None:
-    import myapp.pandas_render  # noqa: F401
+def _load_pandas(seen_type: type) -> None:
+    import myapp.pandas_render  # registers @render.register(pd.DataFrame)
 ```
 
-```python
-# myapp/pandas_render.py
-import pandas as pd
+For dispatchers that should automatically convert unmatched inputs, see
+[Autocasting in `flexdispatch`](#autocasting-in-flexdispatch) below.
 
-from myapp.render import render
+## Casting
 
+### Registering & chaining casts
 
-@render.register(pd.DataFrame)
-def render_dataframe(value: pd.DataFrame) -> str:
-    return value.to_markdown()
-```
-
-The delayed callback receives the concrete matching type and runs once. After
-the import, dispatch uses the regular `pd.DataFrame` registration.
-
-### Casting
-
-`caster` registers conversions using the first positional parameter's annotation
-and the return annotation. Use it directly or configure its cost and graph:
+Register conversions with `@caster` (inferring types from annotations, or
+passing them explicitly) or `@castmethod` inside a class. `cast` finds the
+lowest-cost chain between types.
 
 ```python
-from flextype.cast import cast, caster
+from flextype.cast import cast, caster, castmethod
 
 
 @caster
-def stringify(value: int) -> str:
-    return str(value)
+def to_float(value: int) -> float:
+    return float(value)
 
 
 @caster(cost=1)
-def decode(value: bytes | bytearray) -> str:
-    return value.decode()
-
-
-assert cast(4, str) == "4"
-assert cast(b"hello", str) == "hello"
-
-to_str = cast(str)
-assert to_str(4) == "4"
-assert to_str(b"hello") == "hello"
-```
-
-With one positional argument, `cast(target)` returns a callable accepting a value.
-It preserves any explicit `graph` and `max_*` limits; otherwise, it uses the active
-graph when the callable is invoked. `graph.cast(target)` supports the same form.
-
-Explicit types are also supported: `caster(int, str, stringify)` or
-`@caster((bytes, bytearray), str)`. Unions and tuples register every source/target
-combination with the same function. Parameterized types such as `list[int]` are
-registered against their runtime origin (`list`).
-
-All registration forms return the original function unchanged. Registered caster
-metadata remains available through `CasterGraph.get_direct_caster`.
-Costs must be nonnegative and not NaN; positive infinity is allowed.
-
-Use `castmethod` inside a class to register an instance method. The source is
-always the defining class; the target is inferred from the return annotation or
-given explicitly. Cost, graph, unions, tuples, and generic origins work as with
-`caster`:
-
-```python
-from flextype.cast import cast, castmethod
+def to_str(value: float | bytes) -> str:
+    return value.decode() if isinstance(value, bytes) else f"{value:.1f}"
 
 
 class Message:
@@ -166,75 +104,221 @@ class Message:
     def text(self) -> str:
         return "hello"
 
-    @castmethod(bytes, cost=1)
-    def encode(self):
-        return self.text().encode()
 
+assert cast(4, str) == "4.0"                # chained: int -> float -> str
+assert cast(b"hi", str) == "hi"             # union source
+assert cast(Message(), str) == "hello"      # @castmethod
 
-assert cast(Message(), str) == "hello"
-assert cast(Message(), bytes) == b"hello"
+to_text = cast(str, default="n/a")          # curried callable with fallback
+assert to_text(4) == "4.0"
+assert to_text(object()) == "n/a"
 ```
 
-Registration happens during class creation and preserves normal method binding.
-`castmethod` is intended for instance methods in class bodies: decoration outside
-a class does not register a cast on its own. No source argument is accepted.
-Inferred annotation names resolve against module globals and the owning class
-namespace; otherwise, pass locally scoped target types explicitly.
+### Value-dependent casts & fallback
 
-#### Instance-level applicability
-
-A conversion can raise `CastUnavailable` when it does not apply to a particular
-value. `cast` tries candidate paths in order of `(cost, MRO distance, chain length)`
-until one succeeds. Other exceptions propagate immediately.
+A conversion can raise `CastUnavailable` when it doesn't apply to a particular
+instance. `cast` automatically tries the next-best route; if all routes decline,
+it raises a `CastUnavailableGroup` listing every attempted route.
 
 ```python
+from decimal import Decimal
+
 from flextype.cast import CastUnavailable, cast, caster, try_cast
 
 
 @caster
-def exact_integer(value: float) -> int:
+def exact_int(value: float) -> int:
     if not value.is_integer():
-        raise CastUnavailable("Value is not integral")
+        raise CastUnavailable("not integral")
     return int(value)
 
 
-assert cast(4.0, int) == 4
-attempt = try_cast(4.5, int)
-assert attempt is None
+@caster(cost=1)
+def to_decimal(value: float) -> Decimal:
+    return Decimal(str(value))
+
+
+@caster
+def round_decimal(value: Decimal) -> int:
+    return round(value)
+
+
+assert cast(4.0, int) == 4    # exact_int succeeds (cost 0)
+assert cast(4.6, int) == 5    # exact_int declines -> falls back to float -> Decimal -> int
+
+result = try_cast(4.0, int)   # CastResult(value=4, caster=...) or None
+assert result is not None and result.value == 4
 ```
 
-`try_cast` returns a `CastResult` with `.value` and `.caster` on success, or `None`
-when all candidates decline. The wrapper distinguishes failure from a successful
-conversion whose value is `None`, and retains the conversion's work.
+- `cast(value, target, default=...)` returns `default` on `CastUnavailable`.
+- `try_cast(value, target)` returns `CastResult(value, caster)` or `None`
+  (useful when `None` is a valid cast result or you want to inspect `.caster`).
+- Non-`CastUnavailable` exceptions (e.g. `ValueError`) propagate immediately.
 
-`get_caster(source, target, graph=...)` returns the best structural candidate
-without executing it. `iter_casters(source, target, graph=...)` lazily yields
-ranked, cycle-free candidates, retaining distinct paths through the same
-intermediate type. Search assumes that revisiting a type cannot enable a cast.
-Both APIs use the active graph when `graph` is omitted and accept all three
-inclusive `max_*` limits. The graph exposes the same methods.
+### Multiple targets & wrapper annotations
 
-Calling a candidate executes that one path; it can raise `CastUnavailable`.
-`cast` and `try_cast` perform fallback. No separate predicate is needed: each
-conversion can check cheap prerequisites before doing expensive work, or decline
-after attempting it. Failed chains may already have executed earlier conversions.
-Each alternative starts from the original input and receives its own path budget;
-fallback does not roll back mutations or globally charge failed attempts.
+Pass a union (`B | C`) or tuple (`(B, C)`) as the target. Routes rank by
+`(cost, target_index, -specificity, mro_distance, chain_length)`: lower cost
+always wins; at equal cost, nominal subclasses beat superclasses regardless of
+target order, and unrelated targets break ties by their given order. Already
+compatible inputs return unchanged.
 
-`castable(source, target)` reports structural reachability, rather than guaranteed
-success for an instance. Likewise, `Caster.compatible(value)` checks only source-type
-compatibility. Cached plans and reachability contain no instance-specific results.
+```python
+from typing import Annotated
 
-#### Universal casting middleware
+from flextype import cast, caster, register_type_unwrapper
 
-`universal_caster` registers a conversion receiving both the source value and the
-requested target type. A universal caster is a terminal delegation step: it owns
-the rest of the conversion, including any internal casts or postprocessing.
+
+class Animal: ...
+class Dog(Animal): ...
+class Cat(Animal): ...
+
+
+caster(str, Animal, lambda _: Animal())
+caster(str, Dog, lambda _: Dog())
+
+assert type(cast("rex", Animal)) is Dog    # subclass Dog beats Animal at equal cost
+assert type(cast("rex", (Animal, Cat))) is Dog
+assert cast(4, Annotated[str, "label"]) == "4.0"
+```
+
+`Annotated`, `TypeAliasType`, `NewType`, qualifiers (`Final`, `ReadOnly`, …),
+generic origins (`list[int]` → `list`), and `jaxtyping` array annotations unwrap
+to their underlying runtime types automatically in both `cast` and
+`flexdispatch`. Use `@register_type_unwrapper` to teach both about custom
+wrapper annotations:
+
+```python
+@register_type_unwrapper
+def unwrap_custom(ann: object) -> object | None:
+    return getattr(ann, "__wrapped_type__", None)
+```
+
+### Autocasting
+
+#### Constructor autocasting
+
+Use `metaclass=autocast(*targets)` to refine newly constructed objects into a
+proper subclass via the active cast graph:
+
+```python
+from abc import ABC, abstractmethod
+
+from flextype.autocast import autocast
+from flextype.cast import CastUnavailable, caster
+
+
+class KeyLookup(ABC):
+    @abstractmethod
+    def by_key(self, key: str) -> int: ...
+
+
+class Entries(metaclass=autocast(KeyLookup)):
+    def __init__(self, items: tuple[tuple[str, int], ...]) -> None:
+        self.items = items
+
+
+class _IndexedEntries(Entries, KeyLookup):
+    def __init__(self, items: tuple[tuple[str, int], ...], index: dict[str, int]) -> None:
+        super().__init__(items)
+        self._index = index
+
+    def by_key(self, key: str) -> int:
+        return self._index[key]
+
+
+@caster
+def index_entries(source: Entries) -> KeyLookup:
+    index = dict(source.items)
+    if len(index) != len(source.items):
+        raise CastUnavailable("duplicate keys")
+    return _IndexedEntries(source.items, index)
+
+
+indexed = Entries((("a", 1), ("b", 2)))
+assert isinstance(indexed, KeyLookup) and indexed.by_key("b") == 2
+
+plain = Entries((("a", 1), ("a", 2)))       # declined -> stays Entries
+assert type(plain) is Entries
+```
+
+By default, constructor autocasting uses `max_cost=inf`, `max_mro_distance=0`,
+and `max_chain_length=1`. Pass those kwargs to `autocast(...)` to widen them, or
+use `metaclass=autocast()` on a subclass to disable inherited refinement. A
+replacement must be a proper nominal subclass of the constructed class.
+
+#### Autocasting in `flexdispatch`
+
+Pass `autocast=True` to `flexdispatch` so unmatched inputs are automatically
+cast to the best registered handler before falling back to the default `object`
+implementation:
+
+```python
+from flextype import flexdispatch
+from flextype.cast import CastUnavailable, caster
+
+
+class Raw:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class Document:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class JsonDocument(Document): ...
+
+
+@caster
+def parse_json(raw: Raw) -> JsonDocument:
+    if not raw.text.startswith("{"):
+        raise CastUnavailable("not JSON")
+    return JsonDocument(raw.text)
+
+
+@caster
+def parse_text(raw: Raw) -> Document:
+    return Document(raw.text)
+
+
+@flexdispatch(autocast=True)
+def process(doc: object) -> str:
+    return f"unknown:{doc}"
+
+
+@process.register(Document)
+def _process_doc(doc: Document) -> str:
+    return f"doc:{doc.text}"
+
+
+@process.register(JsonDocument)
+def _process_json(doc: JsonDocument) -> str:
+    return f"json:{doc.text}"
+
+
+assert process(Raw('{"a": 1}')) == 'json:{"a": 1}'   # prefers subclass JsonDocument
+assert process(Raw("hello")) == "doc:hello"           # falls back to Document
+assert process(123) == "unknown:123"                  # no caster -> default handler
+```
+
+Like class `autocast`, `flexdispatch` accepts `max_cost=inf`,
+`max_mro_distance=0`, and `max_chain_length=1`. Direct, subclass, ABC, and
+registry hits bypass casting completely; lazy string and delayed registrations
+resolve before target selection.
+
+### Universal casters
+
+Use `@universal_caster` (or `@universal_castmethod`) for generic wrappers that
+delegate conversion to the requested target type while honoring remaining
+budgets:
 
 ```python
 from dataclasses import dataclass
+from typing import Unpack
 
-from flextype.cast import cast, universal_caster
+from flextype.cast import CastLimits, cast, universal_caster
 
 
 @dataclass
@@ -242,106 +326,35 @@ class Wrapped:
     value: object
 
 
-@universal_caster(cost=1)
-def unwrap[T](
-    value: Wrapped,
-    target: type[T],
-    *,
-    max_cost: float,
-    max_mro_distance: int,
-    max_chain_length: int,
-) -> T:
-    return cast(
-        value.value,
-        target,
-        max_cost=max_cost,
-        max_mro_distance=max_mro_distance,
-        max_chain_length=max_chain_length,
-    )
+@universal_caster(cost=1, target_bound=object)
+def unwrap[T](value: Wrapped, target: type[T], **limits: Unpack[CastLimits]) -> T:
+    return cast(value.value, target, **limits)
 
 
-assert cast(Wrapped(4.0), int, max_cost=1, max_chain_length=2) == 4
+assert cast(Wrapped(4), str, max_cost=2, max_chain_length=3) == "4.0"
 ```
 
-Use `@universal_caster` to infer the source, or provide it explicitly with
-`@universal_caster(Wrapped, cost=1, graph=...)`. Source unions, tuples, and generic
-origins work as with `caster`. `@universal_castmethod` registers an instance method
-with signature `(self, target, *, max_cost, max_mro_distance, max_chain_length)`;
-it infers the source from the defining class and requires no annotations.
-All forms preserve the original function. Each source has one universal
-registration, available through `graph.get_universal_caster(source)`; registering
-another replaces it. Ordinary registrations for that source can coexist.
+Universal casters are terminal steps (tried after finite-cost ordinary routes
+when `max_cost` is unbounded), filtered by `target_bound`, and guarded against
+infinite recursion on the same `(graph, value, target)`.
 
-Both decorators accept `target_bound=SomeBase`, defaulting to `object`. Search
-considers a universal candidate only when
-`issubclass(requested_target, registration.target_bound)` is true. The bound itself
-and its subclasses qualify; its superclasses and unrelated targets do not.
-The bound must be a runtime type supporting `issubclass()`. The converter receives the exact requested
-target, and ineligible candidates are excluded without invoking it. For example,
-`@universal_castmethod(target_bound=str)` permits requests for `str` and its
-subclasses while allowing other routes to handle unrelated targets.
+### Inspecting routes & scoped graphs
 
-The universal function raises `CastUnavailable` to decline a value or target.
-Search binds it directly to the final requested target, including unregistered
-types. It never tries universal conversions to intermediate types. Ordinary
-conversion prefixes may lead to a universal step; further conversion is delegated
-inside that step. Delegation may in turn encounter another wrapper.
+```python
+from flextype.cast import CASTS, CasterGraph, iter_casters, reachable
 
-Nested `cast` and `try_cast` calls track active requests by graph identity, value
-identity, and target type. Re-entering the same request declines it, even with
-different budgets. Thus an `A → B` wrapper whose universal caster delegates back
-to the same `A` instance cannot endlessly restart `A → target`: the recursive
-candidate fails with `CastUnavailable`, allowing the enclosing cast to try its
-alternatives. Guard state is cleared after success or failure. Distinct nested
-wrapper instances, different targets, and delegation to another graph are allowed.
+assert reachable(int, str)
+routes = list(iter_casters(int, str, max_cost=2, max_chain_length=3))
 
-`cost` declares the universal operation's **own overhead**. Its keyword budgets
-already deduct the preceding ordinary conversions and that overhead:
+# Isolate registrations in a custom graph (or bind one via CASTS.set(graph))
+graph = CasterGraph()
+```
 
-| Forwarded budget | Deduction from the original limit |
-| --- | --- |
-| `max_cost` | Prefix cost plus universal overhead |
-| `max_mro_distance` | Prefix MRO distance plus matching the universal source |
-| `max_chain_length` | Prefix length plus one universal step |
+## Instance-Level Registries
 
-The implementation must honor these budgets, typically by forwarding them to an
-inner `cast`. Zero remaining budgets permit identity conversion. Unbounded limits
-(`float("inf")` and `sys.maxsize`) remain unbounded. An infeasible prefix or
-overhead is rejected before invoking the universal function.
-
-For **ranking**, a complete candidate ending in a universal step is charged the
-query's entire `max_cost`. Thus every finite-cost ordinary candidate precedes
-universals when no cost limit is supplied. With a finite limit, ordinary paths
-costing less than that limit come first. Equal-cost candidates use the usual MRO
-and length tie-breakers. The returned candidate's `.cost` reflects this ranking
-allowance; the universal registration's `.cost` retains its actual overhead.
-Delegated execution costs remain opaque, so competing universals cannot be
-ordered by their true total cost. Ranking allowances are never subtracted from
-the execution budget.
-
-#### Structural reachability
-
-Use `graph.get_reachable_casters(source, max_cost=..., max_mro_distance=...,
-max_chain_length=...)` to map reachable registered target types to their best
-casters. Ranking and inclusive limits are the same as `graph.get_caster`.
-
-For a quick, unconstrained check, `graph.get_reachable_types(source)` returns a
-set of reachable registered target types without ranking or constructing casts.
-Pass an optional `target` to stop as soon as a compatible type is found; that
-target is included on success, but the remaining results may be incomplete.
-Enumerations remain limited to registered concrete targets even when a universal
-caster can reach unregistered types. Universal target bounds apply to both
-enumeration and targeted queries. Registration changes and virtual ABC
-registrations invalidate cached reachability and bound matches.
-
-### Registries
-
-`ProtocolRegistry` is useful for defining marker types: runtime-only semantic
-categories that objects can opt into without changing their inheritance
-hierarchy. Unlike regular protocols, these markers can distinguish two objects
-of the same class. That makes them useful for conditional dispatch based on
-state, provenance, validation, or other facts that are not captured by the
-object's structural interface.
+`ProtocolRegistry` and `Registry` extend ABC registration to individual
+instances—either explicitly via `register_instance` or dynamically via
+`__instancehook__`—and integrate directly with `flexdispatch`.
 
 ```python
 from flextype import ProtocolRegistry, flexdispatch
@@ -351,86 +364,44 @@ class Verified(ProtocolRegistry, structural_checking=False):
     pass
 
 
-@flexdispatch
-def publish(document: object) -> str:
-    return "manual review required"
-
-
-@publish.register(Verified)
-def publish_verified(document: Verified) -> str:
-    return "publish immediately"
-
-
-class Document:
-    def __init__(self, title: str) -> None:
-        self.title = title
-
-
-draft = Document("Draft")
-release = Document("Release")
-
-Verified.register_instance(release)
-
-assert publish(draft) == "manual review required"
-assert publish(release) == "publish immediately"
-```
-
-Use `__instancehook__` when membership in a marker type should be dynamic. It is
-called during `isinstance(value, MarkerType)` and can classify objects by runtime
-state, contents, or other predicates instead of explicit registration.
-
-```python
-from flextype import ProtocolRegistry, flexdispatch
-
-
 class IntList(ProtocolRegistry, structural_checking=False):
     @classmethod
     def __instancehook__(cls, instance: object, /) -> bool:
-        return isinstance(instance, list) and all(isinstance(item, int) for item in instance)
+        return isinstance(instance, list) and all(isinstance(x, int) for x in instance)
 
 
 @flexdispatch
-def summarize(value: object) -> str:
-    return "not an int list"
+def handle(value: object) -> str:
+    return "default"
 
 
-@summarize.register(IntList)
-def summarize_int_list(value: list[int]) -> str:
+@handle.register(Verified)
+def _handle_verified(value: Verified) -> str:
+    return "verified"
+
+
+@handle.register(IntList)
+def _handle_ints(value: list[int]) -> str:
     return f"sum={sum(value)}"
 
 
-assert summarize([1, 2, 3]) == "sum=6"
-assert summarize([1, "2", 3]) == "not an int list"
+class Doc: ...
+
+
+draft, release = Doc(), Doc()
+Verified.register_instance(release)
+
+assert handle(draft) == "default"
+assert handle(release) == "verified"
+assert handle([1, 2, 3]) == "sum=6"
+assert handle([1, "2"]) == "default"
 ```
 
-Return `NotImplemented` from `__instancehook__` to fall back to regular
-inheritance and explicit `register` / `register_instance` checks.
-
-By default, `ProtocolRegistry` preserves normal protocol structural checks. Pass
-`structural_checking=False` when the type should behave as an explicit marker
-instead: only inheritance, explicit registrations, and `__instancehook__` decide
-whether an object is an instance of the marker type.
-
-`ProtocolRegistry` is backed by `ProtocolRegistryMeta`, which extends the ABC
-registration concept to instance-level registrations. `Registry` and
-`RegistryMeta` expose the same mechanism for non-protocol marker classes, and
-the metaclasses are exported too when direct metaclass use is the better fit.
-
-Class registries accept the same dotted and `module:qualname` references as
-`flexdispatch`. Available classes are registered immediately; unresolved module
-references are retried on registration, instance checks without a positive
-instance-cache hit, and uncached subclass checks. Resolution registers all
-available references, not just a name matching
-the class being checked. Protocol registries support pending references only
-with `structural_checking=False`; already-loaded string references are eager
-registrations.
-
-Subclass checks use the normal ABC cache and hook. Consequently, an alias to a
-class that previously failed a subclass check can remain a cached miss after
-its module loads, until another uncached check or registration triggers
-promotion. Prefer canonical class paths for registrations; aliases are only
-weakly supported. Ordinary `lazy_isinstance` / `lazy_issubclass` lookups remain
-uncached and may use aliases directly.
+Pass `structural_checking=False` on `ProtocolRegistry` to opt out of standard
+structural protocol matching and rely only on inheritance, registrations, and
+`__instancehook__` (return `NotImplemented` from `__instancehook__` to fall
+through). `Registry` and `RegistryMeta` provide the same mechanism without
+`Protocol`.
 
 ## Development
 

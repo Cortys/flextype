@@ -80,18 +80,14 @@ def test_explicit_target_does_not_require_annotations(active_graph, keyword):
     assert active_graph.cast(Source(), str) == "source"
 
 
-@pytest.mark.parametrize("keyword", [False, True])
 @pytest.mark.parametrize("explicit", [False, True])
-def test_direct_registration_inside_class(active_graph, keyword, explicit):
+def test_direct_registration_inside_class(active_graph, explicit):
     class Source:
         def stringify(self) -> str:
             return "source"
 
         original = stringify
-        if explicit:
-            stringify = castmethod(str, cast_fn=stringify) if keyword else castmethod(str, stringify)
-        else:
-            stringify = castmethod(cast_fn=stringify) if keyword else castmethod(stringify)
+        stringify = castmethod(str, stringify) if explicit else castmethod(stringify)
 
     assert Source.stringify is Source.original
     _assert_registration(active_graph, Source, str, Source.stringify)
@@ -379,9 +375,9 @@ def test_non_instance_method_is_rejected(active_graph, wrapper):
 def test_invalid_explicit_targets_do_not_modify_graph_or_cache(active_graph, target):
     original = ConcreteCaster(bytes, str, str)
     active_graph.add_caster(original)
-    assert active_graph.get_caster(bytes, str) is original
+    assert next(active_graph.iter_casters(bytes, str)) is original
 
-    with pytest.raises(TypeError, match=r"caster type|must not be empty"):
+    with pytest.raises(TypeError, match=r"type annotation|must not be empty"):
 
         class Source:
             @castmethod(target)
@@ -389,7 +385,7 @@ def test_invalid_explicit_targets_do_not_modify_graph_or_cache(active_graph, tar
                 return "source"
 
     assert set(active_graph.casts) == {bytes}
-    assert active_graph.get_cached_caster(bytes, str) is original
+    assert next(active_graph.iter_casters(bytes, str)) is original
 
 
 def test_inferred_target_requires_return_annotation(active_graph):
@@ -410,8 +406,8 @@ def test_inferred_target_requires_return_annotation(active_graph):
 def test_invalid_cost_does_not_modify_graph_or_caches(active_graph, cost):
     original = ConcreteCaster(bytes, str, str)
     active_graph.add_caster(original)
-    assert active_graph.get_caster(bytes, str) is original
-    assert active_graph.get_reachable_types(bytes) == {str}
+    assert next(active_graph.iter_casters(bytes, str)) is original
+    assert active_graph.reachable(bytes, str)
 
     with pytest.raises((RuntimeError, ValueError)) as exc_info:
 
@@ -424,8 +420,7 @@ def test_invalid_cost_does_not_modify_graph_or_caches(active_graph, cost):
     assert isinstance(error, ValueError)
     assert "cost must be nonnegative and not NaN" in str(error)
     assert set(active_graph.casts) == {bytes}
-    assert active_graph.get_cached_caster(bytes, str) is original
-    assert active_graph.reachable_types == {bytes: {str}}
+    assert next(active_graph.iter_casters(bytes, str)) is original
 
 
 def test_method_requires_positional_instance_parameter(active_graph):

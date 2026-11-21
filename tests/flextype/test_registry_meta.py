@@ -607,7 +607,7 @@ class TestProtocolRegistryMeta:
         class Candidate:
             pass
 
-        @runtime_checkable
+        @runtime_checkable  # ty: ignore[invalid-argument-type]  # ProtocolRegistryMeta creates a protocol.
         class RegistryProtocol(ProtocolRegistry):
             x = 1
 
@@ -633,7 +633,7 @@ class TestProtocolRegistryMeta:
     def test_runtime_checkable_protocol_registry_uses_structural_checks(self) -> None:
         """Runtime-checkable protocols should use structural checks when enabled."""
 
-        @runtime_checkable
+        @runtime_checkable  # ty: ignore[invalid-argument-type]  # ProtocolRegistryMeta creates a protocol.
         class RuntimeStructural(ProtocolRegistry):
             def f(self) -> None:
                 return None
@@ -712,7 +712,7 @@ class TestProtocolRegistryMeta:
             pass
 
         assert BaseProtocol.__protocol_attrs__ == set()
-        assert BaseProtocol.__non_callable_proto_members__ == set()  # ty:ignore[unresolved-attribute]
+        assert BaseProtocol.__non_callable_proto_members__ == set()  # ty:ignore[missing-attribute]
 
     def test_structural_checking_false_propagates_to_protocol_subclasses(self) -> None:
         """Protocol subclasses should inherit non-structural checking from their parent."""
@@ -922,7 +922,7 @@ class TestProtocolRegistryMeta:
         assert StructuralProtocol.register("builtins:list") is StructuralProtocol
         with pytest.raises(TypeError, match="runtime_checkable"):
             issubclass(list, StructuralProtocol)
-        runtime_checkable(StructuralProtocol)
+        runtime_checkable(StructuralProtocol)  # ty: ignore[invalid-argument-type]
         assert issubclass(list, StructuralProtocol)
 
     def test_protocol_registry_meta_register_and_register_instance(self) -> None:

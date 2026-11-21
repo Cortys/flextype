@@ -166,9 +166,9 @@ class TestSwitchDispatch:
 
         dispatch = switchdispatch(original)
 
-        assert dispatch.__name__ == original.__name__  # ty: ignore[unresolved-attribute]
+        assert dispatch.__name__ == original.__name__  # ty: ignore[missing-attribute]
         assert dispatch.__doc__ == original.__doc__
-        assert dispatch.__wrapped__ is original  # ty: ignore[unresolved-attribute]
+        assert dispatch.__wrapped__ is original  # ty: ignore[missing-attribute]
 
 
 if TYPE_CHECKING:

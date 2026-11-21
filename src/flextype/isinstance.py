@@ -26,11 +26,24 @@ def _split_type_name(name: str) -> tuple[str, str, bool]:
     return module or "builtins", attributes, False
 
 
+def _return_false() -> bool:
+    return False
+
+
 def _module_name_precheck(index: set[str]) -> Callable[[], bool]:
     """Check live module presence; rebuild this callable when the index changes."""
-    if len(index) == 1:
-        name = next(iter(index))
-        return lambda: sys.modules.get(name) is not None
+    size = len(index)
+    if size == 0:
+        return _return_false
+    if size == 1:
+        (a,) = index
+        return lambda: sys.modules.get(a) is not None
+    if size == 2:
+        a, b = index
+        return lambda: a in sys.modules or b in sys.modules
+    if size == 3:
+        a, b, c = index
+        return lambda: a in sys.modules or b in sys.modules or c in sys.modules
     return lambda: not sys.modules.keys().isdisjoint(index)
 
 
@@ -80,12 +93,12 @@ def _split_lazy_type(lazy_type: LazyType, pending_modules: set[str] | None = Non
             st = t.strip()
             unloaded = set() if pending_modules is not None else None
             resolved_t = _resolve_loaded_type(st, unloaded)
-            if resolved_t is not _UNRESOLVED and isinstance(resolved_t, type):
-                types.add(resolved_t)
-            else:
+            if resolved_t is _UNRESOLVED:
                 strings.add(st)
                 if pending_modules is not None and unloaded:
                     pending_modules.update(unloaded)
+            elif isinstance(resolved_t, type):
+                types.add(resolved_t)
         return types, strings
     if isinstance(lazy_type, type):
         return {lazy_type}, set()

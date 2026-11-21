@@ -38,8 +38,8 @@ include = ["flextype", "flextype.*"]
 
 [dependency-groups]
 lint = [
-    "ruff>=0.17.1",
-    "ty>=0.0.89",
+    "ruff>=0.17.6",
+    "ty>=0.0.107",
 ]
 test = [
     "pytest>=8.0",
@@ -133,4 +133,4 @@ include = ["src/flextype", "tests/flextype"]
 include = ["tests/flextype/**"]
 
 [tool.ty.overrides.rules]
-unresolved-import = "ignore"
+import-not-found = "ignore"

@@ -8,7 +8,7 @@ from typing import TypedDict, Unpack
 
 import pytest
 
-from flextype.cast import CasterGraph, CastUnavailable, cast, caster, universal_caster
+from flextype.cast import CasterGraph, CastUnavailable, CastUnavailableGroup, cast, caster, universal_caster
 
 
 class _Limits(TypedDict):
@@ -49,6 +49,20 @@ def test_wrap_unwrap_cycle_declines_without_executing_a_repeated_request(limits,
             with pytest.raises(CastUnavailable):
                 graph.cast(value, str, **limits)
         assert calls == [value]
+
+
+def test_narrower_request_reports_recursion_when_its_only_route_is_active():
+    graph = CasterGraph()
+    caster(Source, Wrapped, Wrapped, graph=graph)
+
+    @universal_caster(Wrapped, target_bound=str, graph=graph)
+    def unwrap(value, target, **limits: Unpack[_Limits]):
+        return graph.cast(value.value, target, **limits)
+
+    with pytest.raises(CastUnavailableGroup) as caught:
+        graph.cast(Source(), (str, bytes))
+    (reason,) = caught.value.exceptions
+    assert str(reason) == "Recursive cast from Source to str for this value."
 
 
 def test_cycle_rejection_allows_another_candidate_and_cleans_up_after_success():
@@ -177,3 +191,26 @@ def test_copied_context_does_not_keep_guard_active_after_cast_returns():
     later = contexts[0].run(graph.try_cast, value, str)
     assert later is not None
     assert later.value == "done"
+
+
+def test_overlapping_requests_skip_only_the_active_bound_route():
+    class Base: ...
+
+    class Child(Base): ...
+
+    class Other: ...
+
+    graph = CasterGraph()
+    calls = []
+
+    @universal_caster(Source, graph=graph)
+    def convert(value, target, **_limits: object):
+        calls.append(target)
+        if target is Child:
+            assert graph.try_cast(value, (Child, Base), max_cost=0) is None
+            assert type(graph.cast(value, Base)) is Base
+            assert type(graph.cast(value, (Child, Other), max_cost=1)) is Other
+        return target()
+
+    assert type(graph.cast(Source(), (Base, Child))) is Child
+    assert calls == [Child, Base, Other]

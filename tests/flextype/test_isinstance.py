@@ -560,3 +560,30 @@ def test_isinstance_honors_custom_class_attribute(loaded_module: ModuleType) -> 
 
     loaded_module.__dict__["Alias"] = int
     assert lazy_isinstance(Proxy(), f"{loaded_module.__name__}.Alias")
+
+
+@pytest.mark.parametrize("size", [0, 1, 2, 3, 4])
+def test_module_name_precheck_branches(monkeypatch: pytest.MonkeyPatch, size: int) -> None:
+    names = [f"_flextype_precheck_mod_{i}" for i in range(size)]
+    check = _module_name_precheck(set(names))
+    assert not check()
+    if size == 0:
+        return
+    monkeypatch.setitem(sys.modules, names[-1], None)
+    assert check() is (size > 1)
+    monkeypatch.setitem(sys.modules, names[-1], ModuleType(names[-1]))
+    assert check()
+    monkeypatch.delitem(sys.modules, names[-1])
+    assert not check()
+
+
+def test_split_lazy_type_drops_resolved_non_types(loaded_module: ModuleType) -> None:
+    loaded_module.__dict__["Placeholder"] = None
+    pending: set[str] = set()
+    types, strings = _split_lazy_type(
+        (f"{loaded_module.__name__}.Placeholder", "_flextype_unloaded_nontype.Target"),
+        pending,
+    )
+    assert types == set()
+    assert strings == {"_flextype_unloaded_nontype.Target"}
+    assert pending == {"_flextype_unloaded_nontype"}

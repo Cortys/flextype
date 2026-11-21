@@ -12,11 +12,10 @@ from flextype.cast import (
     Caster,
     CasterGraph,
     ConcreteCaster,
-    _IdentityCaster,
-    _IndirectCaster,
+    _ChainCaster,
     cast,
     caster,
-    get_caster,
+    iter_casters,
 )
 
 
@@ -36,11 +35,11 @@ def cast_api(request):
 
 
 @pytest.fixture(params=["explicit_function", "active_function"])
-def get_caster_api(request):
+def iter_casters_api(request):
     graph = CasterGraph()
     token = CASTS.set(graph if request.param == "active_function" else CasterGraph())
     try:
-        yield graph, partial(get_caster, graph=graph) if request.param == "explicit_function" else get_caster
+        yield graph, partial(iter_casters, graph=graph) if request.param == "explicit_function" else iter_casters
     finally:
         CASTS.reset(token)
 
@@ -51,11 +50,11 @@ def test_cheapest_chain_and_cache():
     graph.add_caster(ConcreteCaster(int, float, float, cost=1))
     graph.add_caster(ConcreteCaster(float, str, str, cost=2))
 
-    cast = graph.get_caster(int, str)
-    assert isinstance(cast, _IndirectCaster)
+    cast = next(graph.iter_casters(int, str))
+    assert isinstance(cast, _ChainCaster)
     assert cast.cost == 3
     assert cast(4) == "4.0"
-    assert graph.get_caster(int, str) is cast
+    assert next(graph.iter_casters(int, str)) is cast
 
 
 def test_fractional_costs_are_summed_and_ranked():
@@ -64,8 +63,8 @@ def test_fractional_costs_are_summed_and_ranked():
     graph.add_caster(ConcreteCaster(int, float, float, cost=0.25))
     graph.add_caster(ConcreteCaster(float, str, str, cost=0.5))
 
-    cast = graph.get_caster(int, str)
-    assert isinstance(cast, _IndirectCaster)
+    cast = next(graph.iter_casters(int, str))
+    assert isinstance(cast, _ChainCaster)
     assert cast.cost == 0.75
     assert cast(4) == "4.0"
 
@@ -82,11 +81,11 @@ def test_caster_accepts_nonnegative_costs(cost):
     direct = ConcreteCaster(int, str, str, cost=cost)
     graph.add_caster(direct)
 
-    assert graph.get_caster(int, str) is direct
+    assert next(graph.iter_casters(int, str)) is direct
     assert graph.cast(4, str) == "4"
 
 
-@pytest.mark.parametrize("lookup", ["get_cached_caster", "get_caster", "limited_get_caster", "limited_castable"])
+@pytest.mark.parametrize("lookup", ["iter_casters", "limited_iter_casters", "limited_reachable"])
 def test_abc_registration_invalidates_cached_casts(lookup):
     class Target(ABC):
         @abstractmethod
@@ -103,26 +102,22 @@ def test_abc_registration_invalidates_cached_casts(lookup):
     original = ConcreteCaster(int, Target, lambda _: Nominal(), cost=5)
     graph.add_caster(original)
     graph.add_caster(ConcreteCaster(int, Intermediate, lambda _: Intermediate()))
-    assert graph.get_caster(int, Target) is original
-    graph.get_reachable_types(bytes)
+    assert next(graph.iter_casters(int, Target)) is original
+    assert not graph.reachable(bytes, Target)
 
     Target.register(Intermediate)
 
-    if lookup == "get_cached_caster":
-        assert graph.get_cached_caster(int, Target) is None
-    elif lookup == "get_caster":
-        assert graph.get_caster(int, Target).cost == 0
-    elif lookup == "limited_get_caster":
-        assert graph.get_caster(int, Target, max_cost=0).cost == 0
+    if lookup == "iter_casters":
+        assert next(graph.iter_casters(int, Target)).cost == 0
+    elif lookup == "limited_iter_casters":
+        assert next(graph.iter_casters(int, Target, max_cost=0)).cost == 0
     else:
-        assert graph.castable(int, Target, max_cost=0)
-    assert graph.reachable_types == {}
+        assert graph.reachable(int, Target, max_cost=0)
 
-    selected = graph.get_caster(int, Target)
+    selected = next(graph.iter_casters(int, Target))
     assert selected.cost == 0
     assert isinstance(selected(4), Intermediate)
-    assert graph.get_cached_caster(int, Target) is selected
-    assert graph.get_caster(int, Target) is selected
+    assert next(graph.iter_casters(int, Target)) is selected
 
 
 @pytest.mark.parametrize("warm_cache", [False, True])
@@ -146,22 +141,27 @@ def test_limits_are_inclusive_and_independent(max_cost, max_mro_distance, max_ch
     graph = CasterGraph()
     graph.add_caster(ConcreteCaster(int, Intermediate, Intermediate, cost=0.25))
     graph.add_caster(ConcreteCaster(float, str, str, cost=0.5))
-    cached = graph.get_caster(Source, str) if warm_cache else None
+    cached = next(graph.iter_casters(Source, str)) if warm_cache else None
 
     if reachable:
-        cast = graph.get_caster(
-            Source, str, max_cost=max_cost, max_mro_distance=max_mro_distance, max_chain_length=max_chain_length
+        cast = next(
+            graph.iter_casters(
+                Source, str, max_cost=max_cost, max_mro_distance=max_mro_distance, max_chain_length=max_chain_length
+            )
         )
         assert cast.cost == 0.75
         assert cast(Source(4)) == "4.0"
     else:
-        with pytest.raises(TypeError, match="No cast found"):
-            graph.get_caster(
-                Source, str, max_cost=max_cost, max_mro_distance=max_mro_distance, max_chain_length=max_chain_length
+        with pytest.raises(StopIteration):
+            next(
+                graph.iter_casters(
+                    Source, str, max_cost=max_cost, max_mro_distance=max_mro_distance, max_chain_length=max_chain_length
+                )
             )
 
-    assert graph.get_cached_caster(Source, str) is cached
-    assert graph.get_caster(Source, str)(Source(4)) == "4.0"
+    if cached is not None:
+        assert next(graph.iter_casters(Source, str)) is cached
+    assert next(graph.iter_casters(Source, str))(Source(4)) == "4.0"
 
 
 @pytest.mark.parametrize("warm_cache", [False, True])
@@ -171,13 +171,14 @@ def test_chain_limit_selects_more_expensive_direct_cast(warm_cache):
     graph.add_caster(direct)
     graph.add_caster(ConcreteCaster(int, float, float, cost=1))
     graph.add_caster(ConcreteCaster(float, str, str, cost=2))
-    cached = graph.get_caster(int, str) if warm_cache else None
+    cached = next(graph.iter_casters(int, str)) if warm_cache else None
 
-    assert graph.get_caster(int, str, max_chain_length=1) is direct
-    assert graph.get_cached_caster(int, str) is cached
-    assert graph.get_caster(int, str).cost == 3
-    with pytest.raises(TypeError, match="No cast found"):
-        graph.get_caster(int, str, max_cost=3, max_chain_length=1)
+    assert next(graph.iter_casters(int, str, max_chain_length=1)) is direct
+    if cached is not None:
+        assert next(graph.iter_casters(int, str)) is cached
+    assert next(graph.iter_casters(int, str)).cost == 3
+    with pytest.raises(StopIteration):
+        next(graph.iter_casters(int, str, max_cost=3, max_chain_length=1))
 
 
 @pytest.mark.parametrize("warm_cache", [False, True])
@@ -189,13 +190,14 @@ def test_mro_limit_selects_more_expensive_exact_source(warm_cache):
     exact = ConcreteCaster(Source, str, lambda _: "exact", cost=1)
     graph.add_caster(exact)
     graph.add_caster(ConcreteCaster(int, str, lambda _: "inherited"))
-    cached = graph.get_caster(Source, str) if warm_cache else None
+    cached = next(graph.iter_casters(Source, str)) if warm_cache else None
 
-    assert graph.get_caster(Source, str, max_mro_distance=0) is exact
-    assert graph.get_cached_caster(Source, str) is cached
-    assert graph.get_caster(Source, str)(Source(4)) == "inherited"
-    with pytest.raises(TypeError, match="No cast found"):
-        graph.get_caster(Source, str, max_cost=0, max_mro_distance=0)
+    assert next(graph.iter_casters(Source, str, max_mro_distance=0)) is exact
+    if cached is not None:
+        assert next(graph.iter_casters(Source, str)) is cached
+    assert next(graph.iter_casters(Source, str))(Source(4)) == "inherited"
+    with pytest.raises(StopIteration):
+        next(graph.iter_casters(Source, str, max_cost=0, max_mro_distance=0))
 
 
 @pytest.mark.parametrize("short_cost", [0.0, 1.0])
@@ -212,17 +214,17 @@ def test_chain_limit_keeps_shorter_paths_to_intermediate_types(short_cost):
     graph.add_caster(short)
     graph.add_caster(final)
 
-    cast = graph.get_caster(Source, str, max_chain_length=2)
-    assert isinstance(cast, _IndirectCaster)
+    cast = next(graph.iter_casters(Source, str, max_chain_length=2))
+    assert isinstance(cast, _ChainCaster)
     assert cast.cost == short_cost
-    assert cast.cast_chain == (short, final)
+    assert cast.chain == (short, final)
     assert cast(Source(4)) == "(4+0j)"
 
-    unrestricted = graph.get_caster(Source, str)
-    assert isinstance(unrestricted, _IndirectCaster)
-    assert len(unrestricted.cast_chain) == 3
-    with pytest.raises(TypeError, match="No cast found"):
-        graph.get_caster(Source, str, max_chain_length=1)
+    unrestricted = next(graph.iter_casters(Source, str))
+    assert isinstance(unrestricted, _ChainCaster)
+    assert len(unrestricted.chain) == 3
+    with pytest.raises(StopIteration):
+        next(graph.iter_casters(Source, str, max_chain_length=1))
 
 
 def test_mro_limit_keeps_more_specific_paths_to_intermediate_types():
@@ -239,21 +241,21 @@ def test_mro_limit_keeps_more_specific_paths_to_intermediate_types():
     graph.add_caster(exact)
     graph.add_caster(final)
 
-    cast = graph.get_caster(Source, str, max_mro_distance=1)
-    assert isinstance(cast, _IndirectCaster)
+    cast = next(graph.iter_casters(Source, str, max_mro_distance=1))
+    assert isinstance(cast, _ChainCaster)
     assert cast.cost == 1
-    assert cast.cast_chain == (exact, final)
+    assert cast.chain == (exact, final)
     assert cast(Source(4)) == "4.0"
-    assert graph.get_caster(Source, str).cost == 0
-    with pytest.raises(TypeError, match="No cast found"):
-        graph.get_caster(Source, str, max_mro_distance=0)
+    assert next(graph.iter_casters(Source, str)).cost == 0
+    with pytest.raises(StopIteration):
+        next(graph.iter_casters(Source, str, max_mro_distance=0))
 
 
 @pytest.mark.parametrize(("source", "target"), [(int, int), (bool, int), (int, object)])
 def test_zero_limits_allow_identity_and_upcasts(source, target):
     value = source(1)
-    cast = CasterGraph().get_caster(source, target, max_cost=0, max_mro_distance=0, max_chain_length=0)
-    assert isinstance(cast, _IdentityCaster)
+    cast = next(CasterGraph().iter_casters(source, target, max_cost=0, max_mro_distance=0, max_chain_length=0))
+    assert isinstance(cast, _ChainCaster)
     assert cast(value) is value
 
 
@@ -261,16 +263,18 @@ def test_zero_cost_and_mro_limits_allow_exact_conversion():
     graph = CasterGraph()
     direct = ConcreteCaster(int, str, str)
     graph.add_caster(direct)
-    assert graph.get_caster(int, str, max_cost=0, max_mro_distance=0, max_chain_length=1) is direct
-    with pytest.raises(TypeError, match="No cast found"):
-        graph.get_caster(int, str, max_chain_length=0)
+    assert next(graph.iter_casters(int, str, max_cost=0, max_mro_distance=0, max_chain_length=1)) is direct
+    with pytest.raises(StopIteration):
+        next(graph.iter_casters(int, str, max_chain_length=0))
 
 
 @pytest.mark.parametrize(("max_cost", "max_mro_distance", "max_chain_length"), [(-1, 0, 0), (0, -1, 0), (0, 0, -1)])
 def test_negative_limits_exclude_identity(max_cost, max_mro_distance, max_chain_length):
-    with pytest.raises(TypeError, match="No cast found"):
-        CasterGraph().get_caster(
-            int, int, max_cost=max_cost, max_mro_distance=max_mro_distance, max_chain_length=max_chain_length
+    with pytest.raises(StopIteration):
+        next(
+            CasterGraph().iter_casters(
+                int, int, max_cost=max_cost, max_mro_distance=max_mro_distance, max_chain_length=max_chain_length
+            )
         )
 
 
@@ -278,28 +282,27 @@ def test_direct_cast_and_replacement_invalidate_cache():
     graph = CasterGraph()
     direct = ConcreteCaster(int, str, str)
     graph.add_caster(direct)
-    assert graph.get_caster(int, str) is direct
+    assert next(graph.iter_casters(int, str)) is direct
 
     graph.add_caster(ConcreteCaster(int, str, str, cost=10))
     graph.add_caster(ConcreteCaster(int, float, float))
     graph.add_caster(ConcreteCaster(float, str, str))
-    cast = graph.get_caster(int, str)
+    cast = next(graph.iter_casters(int, str))
     assert cast is not None
     assert cast.cost == 0
 
 
 def test_unreachable_is_cached_and_invalidated():
     graph = CasterGraph()
-    with pytest.raises(TypeError):
-        graph.get_caster(int, str)
+    with pytest.raises(StopIteration):
+        next(graph.iter_casters(int, str))
     graph.add_caster(ConcreteCaster(int, str, str))
-    assert not graph.indirect_casts
-    assert isinstance(graph.get_caster(int, str), ConcreteCaster)
+    assert isinstance(next(graph.iter_casters(int, str)), ConcreteCaster)
 
 
 def test_identity():
-    cast = CasterGraph().get_caster(int, int)
-    assert isinstance(cast, _IdentityCaster)
+    cast = next(CasterGraph().iter_casters(int, int))
+    assert isinstance(cast, _ChainCaster)
     assert cast.cost == 0
     assert cast(4) == 4
 
@@ -313,16 +316,16 @@ def test_inherited_source_and_subclass_target():
 
     graph = CasterGraph()
     graph.add_caster(ConcreteCaster(int, Target, lambda value: Target(str(value)), cost=2))
-    cast = graph.get_caster(Source, str)
+    cast = next(graph.iter_casters(Source, str))
     assert cast.source is Source
-    assert cast.target is str
+    assert cast.target is Target
     assert cast.cost == 2
     assert cast(Source(4)) == "4"
-    assert graph.get_caster(Source, str) is cast
-    assert isinstance(cast, ConcreteCaster)
+    assert next(graph.iter_casters(Source, str)) is cast
+    assert isinstance(cast, _ChainCaster)
     direct = graph.get_direct_caster(int, Target)
     assert direct is not None
-    assert cast.cast_fn is direct.cast_fn
+    assert cast.chain == (direct,)
     assert direct.source is int
     assert direct.target is Target
 
@@ -334,23 +337,23 @@ def test_upcast_between_conversions():
     graph = CasterGraph()
     graph.add_caster(ConcreteCaster(int, Intermediate, Intermediate))
     graph.add_caster(ConcreteCaster(float, str, str))
-    cast = graph.get_caster(int, str)
+    cast = next(graph.iter_casters(int, str))
     assert cast.cost == 0
     assert cast(4) == "4.0"
-    assert isinstance(cast, _IndirectCaster)
-    assert len(cast.cast_chain) == 2
+    assert isinstance(cast, _ChainCaster)
+    assert len(cast.chain) == 2
 
 
 def test_upcast_identity_preserves_value():
     graph = CasterGraph()
-    cast = graph.get_caster(bool, int)
-    assert isinstance(cast, _IdentityCaster)
+    cast = next(graph.iter_casters(bool, int))
+    assert isinstance(cast, _ChainCaster)
     assert cast.source is bool
-    assert cast.target is int
+    assert cast.target is bool
     assert cast.cost == 0
     assert cast(True) is True
-    with pytest.raises(TypeError):
-        graph.get_caster(int, bool)
+    with pytest.raises(StopIteration):
+        next(graph.iter_casters(int, bool))
 
 
 def test_multiple_inheritance_chooses_cheapest_base_and_invalidates_cache():
@@ -366,11 +369,11 @@ def test_multiple_inheritance_chooses_cheapest_base_and_invalidates_cache():
     graph = CasterGraph()
     graph.add_caster(ConcreteCaster(Left, str, lambda _: "left", cost=5))
     graph.add_caster(ConcreteCaster(Right, str, lambda _: "right", cost=1))
-    cast = graph.get_caster(Source, str)
+    cast = next(graph.iter_casters(Source, str))
     assert cast.cost == 1
     assert cast(Source()) == "right"
     graph.add_caster(ConcreteCaster(Left, str, lambda _: "left", cost=0))
-    replacement = graph.get_caster(Source, str)
+    replacement = next(graph.iter_casters(Source, str))
     assert replacement.cost == 0
     assert replacement(Source()) == "left"
 
@@ -382,15 +385,15 @@ def test_cheapest_compatible_target_beats_exact_target():
     graph = CasterGraph()
     graph.add_caster(ConcreteCaster(int, str, str, cost=5))
     graph.add_caster(ConcreteCaster(int, Target, lambda value: Target(str(value)), cost=1))
-    cast = graph.get_caster(int, str)
+    cast = next(graph.iter_casters(int, str))
     assert cast.source is int
-    assert cast.target is str
+    assert cast.target is Target
     assert cast.cost == 1
     assert isinstance(cast(4), Target)
     assert isinstance(cast, ConcreteCaster)
     direct = graph.get_direct_caster(int, Target)
     assert direct is not None
-    assert cast.cast_fn is direct.cast_fn
+    assert cast is direct
     assert direct.target is Target
 
 
@@ -400,12 +403,12 @@ def test_zero_cost_cycle_and_heap_ties():
     graph.add_caster(ConcreteCaster(int, bytes, bytes, cost=0))
     graph.add_caster(ConcreteCaster(float, int, int, cost=0))
     graph.add_caster(ConcreteCaster(float, str, str, cost=1))
-    cast = graph.get_caster(int, str)
+    cast = next(graph.iter_casters(int, str))
     assert cast is not None
     assert cast.cost == 1
     assert cast(4) == "4.0"
-    with pytest.raises(TypeError):
-        graph.get_caster(int, complex)
+    with pytest.raises(StopIteration):
+        next(graph.iter_casters(int, complex))
 
 
 @pytest.mark.parametrize("chain_cost", [0.0, 0.5])
@@ -418,16 +421,17 @@ def test_cost_then_specificity_then_chain_length(chain_cost):
     graph.add_caster(ConcreteCaster(Source, float, float, cost=chain_cost))
     graph.add_caster(ConcreteCaster(float, str, str))
 
-    cast = graph.get_caster(Source, str)
+    cast = next(graph.iter_casters(Source, str))
     assert cast.cost == 0
     if chain_cost == 0:
-        assert isinstance(cast, _IndirectCaster)
-        assert len(cast.cast_chain) == 2
+        assert isinstance(cast, _ChainCaster)
+        assert len(cast.chain) == 2
         assert cast(Source(4)) == "4.0"
     else:
-        assert isinstance(cast, ConcreteCaster)
+        assert isinstance(cast, _ChainCaster)
+        assert len(cast.chain) == 1
         assert cast(Source(4)) == "inherited"
-    assert graph.get_caster(Source, str) is cast
+    assert next(graph.iter_casters(Source, str)) is cast
 
 
 @pytest.mark.parametrize("inherited_first", [True, False])
@@ -457,10 +461,10 @@ def test_a_to_b_to_c_is_preferred_over_inherited_d_to_c(inherited_first):
     assert all(registered.cost == 0.0 for registered in casts)
     assert A.__mro__.index(D) == 1
 
-    selected = graph.get_caster(A, C)
-    assert isinstance(selected, _IndirectCaster)
+    selected = next(graph.iter_casters(A, C))
+    assert isinstance(selected, _ChainCaster)
     assert selected.cost == 0.0
-    assert selected.cast_chain == (a_to_b, b_to_c)
+    assert selected.chain == (a_to_b, b_to_c)
     assert selected(A()) is via_b
 
 
@@ -580,10 +584,10 @@ def test_shorter_chain_wins_when_total_cost_and_mro_distance_tie(cost):
     graph.add_caster(ConcreteCaster(int, bytes, bytes, cost=cost))
     graph.add_caster(ConcreteCaster(bytes, str, lambda _: "short"))
 
-    cast = graph.get_caster(int, str)
+    cast = next(graph.iter_casters(int, str))
     assert cast.cost == cost
-    assert isinstance(cast, _IndirectCaster)
-    assert len(cast.cast_chain) == 2
+    assert isinstance(cast, _ChainCaster)
+    assert len(cast.chain) == 2
     assert cast(4) == "short"
 
 
@@ -593,7 +597,7 @@ def test_zero_cost_direct_cast_wins_chain_length_tie_breaker():
     graph.add_caster(ConcreteCaster(float, str, str))
     direct = ConcreteCaster(int, str, lambda _: "direct")
     graph.add_caster(direct)
-    assert graph.get_caster(int, str) is direct
+    assert next(graph.iter_casters(int, str)) is direct
 
 
 @pytest.mark.parametrize("registration", ["concrete", "direct", "decorator"])
@@ -628,20 +632,9 @@ def test_caster_registers_in_explicit_graph():
     assert registered.cast_fn is stringify
 
 
-@pytest.mark.parametrize("keyword", [False, True])
-def test_caster_direct_registration(keyword):
+def test_caster_direct_registration():
     graph = CasterGraph()
-    cast = (
-        caster(int, str, cast_fn=str, cost=3, graph=graph)
-        if keyword
-        else caster(
-            int,
-            str,
-            str,
-            cost=3,
-            graph=graph,
-        )
-    )
+    cast = caster(int, str, str, cost=3, graph=graph)
     assert cast is str
     assert cast(4) == "4"
     registered = graph.get_direct_caster(int, str)
@@ -726,7 +719,6 @@ def test_single_argument_cast_uses_runtime_source_type(cast_api):
 def test_single_argument_cast_defers_lookup(cast_api):
     graph, cast_value = cast_api
     convert = cast_value(str)
-    assert not graph.indirect_casts
 
     with pytest.raises(TypeError, match="No cast found"):
         convert(4)
@@ -768,7 +760,7 @@ def test_single_argument_cast_propagates_conversion_error(cast_api):
 @pytest.mark.parametrize("target", [4, None, "str"])
 def test_single_argument_cast_requires_type(cast_api, target):
     _, cast_value = cast_api
-    with pytest.raises(TypeError, match="requires a target type"):
+    with pytest.raises(TypeError, match="Invalid type annotation"):
         cast_value(target)
 
 
@@ -808,7 +800,7 @@ def test_cast_respects_limits(cast_api, limits, expected, warm_cache, curried):
     caster(float, str, str, cost=0.5, graph=graph)
     caster(Source, str, lambda _: "direct", cost=1, graph=graph)
     value = Source(4)
-    cached = graph.get_caster(Source, str) if warm_cache else None
+    cached = next(graph.iter_casters(Source, str)) if warm_cache else None
     convert = cast_value(str, **limits) if curried else partial(cast_value, target=str, **limits)
 
     if expected is None:
@@ -817,7 +809,8 @@ def test_cast_respects_limits(cast_api, limits, expected, warm_cache, curried):
     else:
         assert convert(value) == expected
 
-    assert graph.get_cached_caster(Source, str) is cached
+    if cached is not None:
+        assert next(graph.iter_casters(Source, str)) is cached
     assert cast_value(value, str) == "4.0"
 
 
@@ -891,14 +884,13 @@ def test_caster_uses_context_active_at_decoration():
 def test_caster_explicit_graph_overrides_context_and_invalidates_cache():
     graph = CasterGraph()
     graph.add_caster(ConcreteCaster(int, str, str, cost=10))
-    graph.get_caster(int, str)
+    next(graph.iter_casters(int, str))
     active_graph = CasterGraph()
     token = CASTS.set(active_graph)
     try:
         cast = caster(int, str, graph=graph)(str)
-        assert not graph.indirect_casts
         assert cast is str
-        registered = graph.get_caster(int, str)
+        registered = next(graph.iter_casters(int, str))
         assert isinstance(registered, ConcreteCaster)
         assert registered.cast_fn is cast
         assert active_graph.get_direct_caster(int, str) is None
@@ -906,30 +898,30 @@ def test_caster_explicit_graph_overrides_context_and_invalidates_cache():
         CASTS.reset(token)
 
 
-def test_get_caster_returns_cached_caster(get_caster_api):
-    graph, lookup = get_caster_api
+def test_iter_casters_returns_cached_caster(iter_casters_api):
+    graph, lookup = iter_casters_api
     caster(int, str, str, cost=10, graph=graph)
     caster(int, float, float, cost=1, graph=graph)
     caster(float, str, str, cost=2, graph=graph)
 
-    selected = lookup(int, str)
+    selected = next(lookup(int, str))
     assert selected.cost == 3
     assert selected(4) == "4.0"
-    assert selected is graph.get_caster(int, str)
-    assert lookup(int, str) is selected
+    assert selected is next(graph.iter_casters(int, str))
+    assert next(lookup(int, str)) is selected
 
 
-def test_get_caster_explicit_graph_overrides_active_graph():
+def test_iter_casters_explicit_graph_overrides_active_graph():
     graph = CasterGraph()
     active_graph = CasterGraph()
     caster(int, str, lambda _: "explicit", graph=graph)
     caster(int, str, lambda _: "active", graph=active_graph)
     token = CASTS.set(active_graph)
     try:
-        selected = get_caster(int, str, graph=graph)
+        selected = next(iter_casters(int, str, graph=graph))
         assert_type(selected, Caster[int, str])
         assert selected(4) == "explicit"
-        assert get_caster(int, str)(4) == "active"
+        assert next(iter_casters(int, str))(4) == "active"
     finally:
         CASTS.reset(token)
 
@@ -949,25 +941,25 @@ def test_get_caster_explicit_graph_overrides_active_graph():
         ({"max_cost": 0.75, "max_chain_length": 1}, None),
     ],
 )
-def test_get_caster_respects_limits(get_caster_api, limits, expected):
+def test_iter_casters_respects_limits(iter_casters_api, limits, expected):
     class Source(int):
         pass
 
-    graph, lookup = get_caster_api
+    graph, lookup = iter_casters_api
     caster(int, float, float, cost=0.25, graph=graph)
     caster(float, str, str, cost=0.5, graph=graph)
     caster(Source, str, lambda _: "direct", cost=1, graph=graph)
-    cached = lookup(Source, str)
+    cached = next(lookup(Source, str))
 
     if expected is None:
-        with pytest.raises(TypeError, match="No cast found"):
-            lookup(Source, str, **limits)
+        with pytest.raises(StopIteration):
+            next(lookup(Source, str, **limits))
     else:
-        assert lookup(Source, str, **limits)(Source(4)) == expected
-    assert lookup(Source, str) is cached
+        assert next(lookup(Source, str, **limits))(Source(4)) == expected
+    assert next(lookup(Source, str)) is cached
 
 
-def test_get_caster_zero_limits_preserve_identity(get_caster_api):
-    _, lookup = get_caster_api
-    selected = lookup(bool, int, max_cost=0, max_mro_distance=0, max_chain_length=0)
+def test_iter_casters_zero_limits_preserve_identity(iter_casters_api):
+    _, lookup = iter_casters_api
+    selected = next(lookup(bool, int, max_cost=0, max_mro_distance=0, max_chain_length=0))
     assert selected(True) is True

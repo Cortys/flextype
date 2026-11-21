@@ -158,11 +158,11 @@ class Set(set):
 def make_builtin_weakrefable[T: object](obj: T) -> T:
     """Wrap built-in types in a weak-referenceable wrapper to allow them to be registered in registries."""
     if type(obj) is list:
-        return List(obj)  # ty:ignore[invalid-return-type]
+        return List(obj)  # ty:ignore[invalid-explicit-return]
     if type(obj) is dict:
-        return Dict(obj)  # ty:ignore[invalid-return-type]
+        return Dict(obj)  # ty:ignore[invalid-explicit-return]
     if type(obj) is set:
-        return Set(obj)  # ty:ignore[invalid-return-type]
+        return Set(obj)  # ty:ignore[invalid-explicit-return]
     return obj
 
 

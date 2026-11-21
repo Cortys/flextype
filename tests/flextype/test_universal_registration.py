@@ -19,7 +19,7 @@ def active_graph():
         CASTS.reset(token)
 
 
-@pytest.mark.parametrize("style", ["bare", "empty", "explicit", "direct", "keyword", "inferred_keyword"])
+@pytest.mark.parametrize("style", ["bare", "empty", "explicit", "direct"])
 def test_function_forms_preserve_the_original_function(active_graph, style):
     def convert[T](value: int, target: type[T], **_limits: object) -> T:
         result = str(value)
@@ -33,12 +33,8 @@ def test_function_forms_preserve_the_original_function(active_graph, style):
         decorated = universal_caster()(convert)
     elif style == "explicit":
         decorated = universal_caster(int)(convert)
-    elif style == "direct":
-        decorated = universal_caster(int, convert)
-    elif style == "keyword":
-        decorated = universal_caster(int, cast_fn=convert)
     else:
-        decorated = universal_caster(cast_fn=convert)
+        decorated = universal_caster(int, convert)
 
     assert decorated is convert
     registration = active_graph.get_universal_caster(int)
@@ -108,16 +104,16 @@ def test_invalid_cost_does_not_change_registrations_or_caches(active_graph, cost
     def convert(value, target, **_limits: object):
         return target(value)
 
-    selected = active_graph.get_caster(int, str)
+    selected = next(active_graph.iter_casters(int, str))
     with pytest.raises(ValueError, match="nonnegative and not NaN"):
         universal_caster(float, convert, cost=cost)
     assert set(active_graph.universal_casts) == {int}
-    assert active_graph.get_cached_caster(int, str) is selected
+    assert next(active_graph.iter_casters(int, str)) is selected
 
 
 @pytest.mark.parametrize("source", [Any, Literal[1], (), (int, 42)])
 def test_invalid_source_does_not_partially_register(active_graph, source):
-    with pytest.raises(TypeError, match=r"caster type|must not be empty"):
+    with pytest.raises(TypeError, match=r"type annotation|must not be empty"):
         universal_caster(source, lambda value, _target, **_limits: value)
     assert not active_graph.universal_casts
 
@@ -143,7 +139,7 @@ def test_inferred_source_annotation_is_required(active_graph):
     assert not active_graph.universal_casts
 
 
-@pytest.mark.parametrize("style", ["bare", "empty", "direct", "keyword"])
+@pytest.mark.parametrize("style", ["bare", "empty", "direct"])
 def test_method_forms_preserve_binding_and_signatures(active_graph, style):
     class Source:
         def convert[T](self, target: type[T], **_limits: object) -> T:
@@ -157,10 +153,8 @@ def test_method_forms_preserve_binding_and_signatures(active_graph, style):
             convert = universal_castmethod(convert)
         elif style == "empty":
             convert = universal_castmethod()(convert)
-        elif style == "direct":
-            convert = universal_castmethod(convert, cost=2)
         else:
-            convert = universal_castmethod(cast_fn=convert, cost=2)
+            convert = universal_castmethod(convert, cost=2)
 
     assert Source.convert is Source.original
     assert signature(Source.convert) == signature(Source.original)
@@ -248,18 +242,16 @@ def test_replacement_invalidates_derived_caches(active_graph):
         return "original"
 
     assert active_graph.cast(4, str) == "original"
-    active_graph.get_reachable_types(int)
+    assert active_graph.reachable(int, str)
 
     @universal_caster(int)
     def replacement(_value, _target, **_limits: object):
         return "replacement"
 
-    assert active_graph.indirect_casts == {}
-    assert active_graph.reachable_types == {}
     assert active_graph.cast(4, str) == "replacement"
 
 
-@pytest.mark.parametrize("style", ["function", "factory", "explicit", "direct", "keyword", "inferred_keyword"])
+@pytest.mark.parametrize("style", ["function", "factory", "explicit", "direct"])
 def test_target_bound_is_supported_in_every_function_form(active_graph, style):
     def convert(value: int, target, **_limits: object):
         return target(value)
@@ -270,17 +262,13 @@ def test_target_bound_is_supported_in_every_function_form(active_graph, style):
         decorated = universal_caster(target_bound=str)(convert)
     elif style == "explicit":
         decorated = universal_caster(int, target_bound=str)(convert)
-    elif style == "direct":
-        decorated = universal_caster(int, convert, target_bound=str)
-    elif style == "keyword":
-        decorated = universal_caster(int, cast_fn=convert, target_bound=str)
     else:
-        decorated = universal_caster(cast_fn=convert, target_bound=str)
+        decorated = universal_caster(int, convert, target_bound=str)
 
     assert decorated is convert
     assert active_graph.get_universal_caster(int).target_bound is str
     assert active_graph.cast(4, str) == "4"
-    assert not active_graph.castable(int, bytes)
+    assert not active_graph.reachable(int, bytes)
 
 
 def test_stacked_method_registrations_preserve_distinct_target_bounds(active_graph):
@@ -300,9 +288,9 @@ def test_stacked_method_registrations_preserve_distinct_target_bounds(active_gra
     assert registration is not None
     assert registration.target_bound is bytes
     assert active_graph.cast(Child(), str) == ""
-    assert not active_graph.castable(Child, bytes)
+    assert not active_graph.reachable(Child, bytes)
     assert other.cast(Child(), bytes) == b""
-    assert not other.castable(Child, str)
+    assert not other.reachable(Child, str)
 
 
 class _NonRuntimeProtocol(Protocol):
@@ -329,8 +317,8 @@ def test_invalid_bounds_do_not_modify_graphs_or_caches(active_graph, bound, regi
     def convert(_value, target, **_limits: object):
         return target()
 
-    original = active_graph.get_caster(int, str)
-    active_graph.get_reachable_types(int)
+    original = next(active_graph.iter_casters(int, str))
+    assert active_graph.reachable(int, str)
     register = {
         "function": partial(universal_caster, (int, float), convert),
         "method": partial(universal_castmethod, convert),
@@ -339,8 +327,7 @@ def test_invalid_bounds_do_not_modify_graphs_or_caches(active_graph, bound, regi
     with pytest.raises(TypeError, match="target_bound must be a runtime type"):
         register(target_bound=bound)
     assert set(active_graph.universal_casts) == {int}
-    assert active_graph.get_cached_caster(int, str) is original
-    assert active_graph.reachable_types == {int: set()}
+    assert next(active_graph.iter_casters(int, str)) is original
 
 
 def test_runtime_checkable_method_protocol_is_accepted_as_target_bound(active_graph):
@@ -352,6 +339,6 @@ def test_runtime_checkable_method_protocol_is_accepted_as_target_bound(active_gr
     def convert(_value, target, **_limits: object):
         return target()
 
-    assert active_graph.castable(int, Runnable)
-    assert not active_graph.castable(int, str)
+    assert active_graph.reachable(int, Runnable)
+    assert not active_graph.reachable(int, str)
     assert isinstance(active_graph.cast(1, Runnable), Runnable)

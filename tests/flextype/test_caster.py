@@ -78,14 +78,13 @@ def test_configured_inferred_decorator_overrides_active_graph(active_graph):
     assert not active_graph.casts
 
 
-@pytest.mark.parametrize("keyword", [False, True])
-def test_inferred_direct_registration_returns_original(keyword):
+def test_inferred_direct_registration_returns_original():
     graph = CasterGraph()
 
     def stringify(value: int) -> str:
         return str(value)
 
-    registered = caster(cast_fn=stringify, cost=2, graph=graph) if keyword else caster(stringify, cost=2, graph=graph)
+    registered = caster(stringify, cost=2, graph=graph)
     assert registered is stringify
     _assert_registrations(graph, (int,), (str,), stringify, cost=2)
 
@@ -221,14 +220,13 @@ def test_configured_decorator_infers_user_defined_generic_target():
     assert graph.cast([1, 2], _Box).value == [1, 2]
 
 
-@pytest.mark.parametrize("keyword", [False, True])
-def test_direct_registration_infers_legacy_generic_annotations(keyword):
+def test_direct_registration_infers_legacy_generic_annotations():
     graph = CasterGraph()
 
     def convert(value: typing.List[int]) -> typing.Tuple[int, ...]:  # noqa: UP006 - Exercise legacy generic aliases.
         return tuple(value)
 
-    registered = caster(cast_fn=convert, graph=graph) if keyword else caster(convert, graph=graph)
+    registered = caster(convert, graph=graph)
     assert registered is convert
     _assert_registrations(graph, (list,), (tuple,), convert)
     assert_type(registered([1, 2]), tuple[int, ...])
@@ -331,7 +329,7 @@ def test_inference_requires_a_positional_parameter(kind):
 
 def test_uninspectable_inferred_callable():
     with pytest.raises(TypeError, match="inspectable signature"):
-        caster(cast_fn=str, graph=CasterGraph())
+        caster(iter, graph=CasterGraph())
 
 
 @pytest.mark.parametrize("inferred", [False, True])
@@ -369,12 +367,12 @@ def test_invalid_types_do_not_modify_graph_or_cache(source, target):
     graph = CasterGraph()
     original = ConcreteCaster(bytes, str, str)
     graph.add_caster(original)
-    assert graph.get_caster(bytes, str) is original
+    assert next(graph.iter_casters(bytes, str)) is original
 
-    with pytest.raises(TypeError, match=r"caster type|must not be empty"):
+    with pytest.raises(TypeError, match=r"type annotation|must not be empty"):
         caster(source, target, str, graph=graph)
     _assert_registrations(graph, (bytes,), (str,), str)
-    assert graph.get_cached_caster(bytes, str) is original
+    assert next(graph.iter_casters(bytes, str)) is original
 
 
 @pytest.mark.parametrize("cost", [-1, float("-inf"), float("nan")])
@@ -383,8 +381,8 @@ def test_invalid_costs_do_not_modify_graph_or_caches(cost, inferred):
     graph = CasterGraph()
     original = ConcreteCaster(bytes, str, str)
     graph.add_caster(original)
-    assert graph.get_caster(bytes, str) is original
-    assert graph.get_reachable_types(bytes) == {str}
+    assert next(graph.iter_casters(bytes, str)) is original
+    assert graph.reachable(bytes, str)
 
     def stringify(value: float) -> str:
         return str(value)
@@ -396,22 +394,16 @@ def test_invalid_costs_do_not_modify_graph_or_caches(cost, inferred):
         decorate(stringify)
 
     _assert_registrations(graph, (bytes,), (str,), str)
-    assert graph.get_cached_caster(bytes, str) is original
-    assert graph.reachable_types == {bytes: {str}}
+    assert next(graph.iter_casters(bytes, str)) is original
 
 
-@pytest.mark.parametrize("with_cast_fn", [False, True])
 @pytest.mark.parametrize(
     "types",
     [{"source": int}, {"target": str}, {"source": int, "target": None}, {"source": None, "target": str}],
 )
-def test_explicit_source_and_target_must_be_given_together(types, with_cast_fn):
-    if with_cast_fn:
-        with pytest.raises(TypeError, match="both source and target"):
-            caster(cast_fn=str, **types)
-    else:
-        with pytest.raises(TypeError, match="both source and target"):
-            caster(**types)
+def test_explicit_source_and_target_must_be_given_together(types):
+    with pytest.raises(TypeError, match="both source and target"):
+        caster(**types)
 
 
 @pytest.mark.parametrize("cast_fn", [42, object()])
@@ -458,10 +450,9 @@ if TYPE_CHECKING:
         def wrong_return(value: int) -> int:
             return value
 
-        caster(source=int)  # ty: ignore[invalid-argument-type]
-        caster(target=str)  # ty: ignore[invalid-argument-type]
-        caster(int, None, stringify)  # ty: ignore[no-matching-overload]
-        caster(None, str, stringify)  # ty: ignore[no-matching-overload]
-        caster(bytes, str, stringify)  # ty: ignore[no-matching-overload]
+        caster(source=int)  # ty: ignore[no-matching-overload]
+        caster(target=str)  # ty: ignore[no-matching-overload]
+        caster(int | bytes, str, "not callable")  # ty: ignore[no-matching-overload]
+        caster(bytes, str)(stringify)  # ty: ignore[invalid-argument-type]
         caster(int, str)(wrong_return)  # ty: ignore[invalid-argument-type]
         caster(int, str)(bytes.decode)  # ty: ignore[invalid-argument-type]
