@@ -12,7 +12,7 @@ from heapq import heappop, heappush
 from inspect import Parameter, Signature, signature
 from itertools import count, groupby
 import sys
-from types import FunctionType
+from types import FunctionType, MemberDescriptorType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -25,6 +25,7 @@ from typing import (
     get_type_hints,
     overload,
 )
+import weakref
 
 from .annotations import is_type_spec, unwrap_types
 
@@ -455,6 +456,19 @@ class CasterGraph:
         self.universal_casts[cast.source] = cast
         self._clear_caches()
 
+    def _remove_caster(self, cast: ConcreteCaster) -> None:
+        targets = self.casts.get(cast.source)
+        if targets is not None and targets.get(cast.target) is cast:
+            del targets[cast.target]
+            if not targets:
+                del self.casts[cast.source]
+            self._clear_caches()
+
+    def _remove_universal_caster(self, cast: UniversalCaster) -> None:
+        if self.universal_casts.get(cast.source) is cast:
+            del self.universal_casts[cast.source]
+            self._clear_caches()
+
     def get_direct_caster[S, T](self, source: type[S], target: type[T]) -> ConcreteCaster[S, T] | None:
         """Look up the registration for an exact source and target."""
         return self.casts.get(source, {}).get(target)
@@ -859,16 +873,62 @@ def caster(
     return decorate if fn is None else decorate(fn)
 
 
+def _is_class_scoped(fn: FunctionType, owner: type) -> bool:
+    return fn.__module__ == owner.__module__ and fn.__qualname__.rpartition(".")[0] == owner.__qualname__
+
+
+def _replaces_owner(previous: type, current: type) -> bool:
+    params = previous.__dict__.get("__dataclass_params__")
+    return params is not None and current.__dict__.get("__dataclass_params__") is params
+
+
+@dataclass(slots=True)
+class _MethodRegistration:
+    """Registrations created by one __set_name__ call, held weakly to avoid retaining replaced classes."""
+
+    owner: weakref.ReferenceType[type]
+    ordinary: tuple[tuple[CasterGraph, weakref.ReferenceType[ConcreteCaster]], ...]
+    universal: tuple[tuple[CasterGraph, weakref.ReferenceType[UniversalCaster]], ...]
+
+    def unregister(self) -> None:
+        for graph, ref in self.ordinary:
+            if (registration := ref()) is not None:
+                graph._remove_caster(registration)  # noqa: SLF001
+        for graph, ref in self.universal:
+            if (registration := ref()) is not None:
+                graph._remove_universal_caster(registration)  # noqa: SLF001
+
+
 @dataclass(slots=True)
 class _PendingMethod:
-    """Restore normal method binding after registering the defining class."""
+    """Keep castmethod registrations in sync across class replacement while binding like the original function."""
 
     fn: FunctionType
     ordinary: list[tuple[tuple[type, ...] | None, float, CasterGraph]] = field(default_factory=list)
     universal: list[tuple[type, float, CasterGraph]] = field(default_factory=list)
+    _registrations: list[_MethodRegistration] = field(default_factory=list, init=False, repr=False, compare=False)
+    _class_scoped: bool | None = field(default=None, init=False, repr=False, compare=False)
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         return self.fn(*args, **kwargs)
+
+    def __get__(self, instance: object, owner: type | None = None) -> object:
+        return self.fn.__get__(instance, owner)
+
+    @property
+    def __wrapped__(self) -> FunctionType:
+        return self.fn
+
+    @property
+    def __isabstractmethod__(self) -> bool:
+        return bool(self.fn.__dict__.get("__isabstractmethod__", False))
+
+    @__isabstractmethod__.setter
+    def __isabstractmethod__(self, value: bool) -> None:
+        self.fn.__dict__["__isabstractmethod__"] = value
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.fn, name)
 
     @classmethod
     def wrap(cls, fn: object) -> _PendingMethod:
@@ -889,7 +949,8 @@ class _PendingMethod:
             """Resolve only the return annotation, independently of the parameters."""
 
         annotated_return.__annotations__ = {"return": annotation}
-        localns = {**vars(owner), owner.__name__: owner}
+        localns = {key: value for key, value in vars(owner).items() if not isinstance(value, MemberDescriptorType)}
+        localns[owner.__name__] = owner
         for obj in (owner, self.fn):
             localns.update((p.__name__, p) for p in getattr(obj, "__type_params__", ()))
         return unwrap_types(
@@ -897,13 +958,32 @@ class _PendingMethod:
         )
 
     def __set_name__(self, owner: type, name: str) -> None:
+        del name
         inferred = self.inferred_targets(owner) if any(targets is None for targets, _, _ in self.ordinary) else ()
+        if self._class_scoped is None:
+            self._class_scoped = _is_class_scoped(self.fn, owner)
+        kept: list[_MethodRegistration] = []
+        for entry in self._registrations:
+            previous = entry.owner()
+            if previous is None:
+                continue
+            if self._class_scoped or previous is owner or _replaces_owner(previous, owner):
+                entry.unregister()
+            else:
+                kept.append(entry)
+        ordinary_refs: list[tuple[CasterGraph, weakref.ReferenceType[ConcreteCaster]]] = []
         for targets, cost, graph in self.ordinary:
             for target in inferred if targets is None else targets:
-                graph.add_caster(ConcreteCaster(owner, target, self.fn, cost=cost))
+                registration = ConcreteCaster(owner, target, self.fn, cost=cost)
+                graph.add_caster(registration)
+                ordinary_refs.append((graph, weakref.ref(registration)))
+        universal_refs: list[tuple[CasterGraph, weakref.ReferenceType[UniversalCaster]]] = []
         for bound, cost, graph in self.universal:
-            graph.add_universal_caster(UniversalCaster(owner, self.fn, cost=cost, target_bound=bound))
-        setattr(owner, name, self.fn)
+            registration = UniversalCaster(owner, self.fn, cost=cost, target_bound=bound)
+            graph.add_universal_caster(registration)
+            universal_refs.append((graph, weakref.ref(registration)))
+        kept.append(_MethodRegistration(weakref.ref(owner), tuple(ordinary_refs), tuple(universal_refs)))
+        self._registrations = kept
 
 
 @overload

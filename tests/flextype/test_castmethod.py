@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+import gc
 from inspect import signature
 import sys
 from typing import TYPE_CHECKING, Any, Literal, Union, assert_type
+import weakref
 
 import pytest
 
+from flextype.autocast import autocast
 from flextype.cast import CASTS, CasterGraph, ConcreteCaster, castmethod
 
 
@@ -433,6 +438,281 @@ def test_method_requires_positional_instance_parameter(active_graph):
             stringify = castmethod(stringify)
 
     assert not active_graph.casts
+
+
+@pytest.mark.parametrize(
+    "dc_kwargs",
+    [
+        {"slots": True},
+        {"slots": True, "frozen": True},
+        {"slots": True, "weakref_slot": True},
+        {"slots": False},
+    ],
+)
+def test_dataclass_registers_final_class_without_stale_entries(active_graph, dc_kwargs):
+    @dataclass(**dc_kwargs)
+    class Source:
+        value: int
+
+        @castmethod
+        def stringify(self) -> str:
+            return str(self.value)
+
+    assert set(active_graph.casts) == {Source}
+    _assert_registration(active_graph, Source, str, Source.stringify)
+    assert Source(42).stringify() == "42"
+    assert active_graph.cast(Source(42), str) == "42"
+
+
+def test_dataclass_slots_discards_replaced_class_for_gc(active_graph):
+    seen: list[weakref.ReferenceType[type]] = []
+
+    def capture(cls):
+        seen.append(weakref.ref(cls))
+        return cls
+
+    class Base:
+        pass
+
+    @dataclass(slots=True)
+    @capture
+    class Source(Base):
+        value: int
+
+        @castmethod
+        def stringify(self) -> str:
+            return str(self.value)
+
+    assert len(seen) == 1
+    assert seen[0]() is not Source
+    assert set(active_graph.casts) == {Source}
+    assert active_graph.cast(Source(7), str) == "7"
+
+    gc.collect()
+    assert seen[0]() is None
+    assert Base.__subclasses__() == [Source]
+
+
+def test_dataclass_slots_self_referential_and_stacked_registrations(active_graph):
+    other_graph = CasterGraph()
+
+    @dataclass(slots=True)
+    class Source:
+        value: int
+
+        @castmethod
+        def copy(self) -> Source:
+            return Source(self.value)
+
+        @castmethod
+        @castmethod(bytes, cost=2)
+        @castmethod(str, cost=3, graph=other_graph)
+        def stringify(self) -> str:
+            return str(self.value)
+
+    assert set(active_graph.casts) == {Source}
+    assert set(active_graph.casts[Source]) == {Source, str, bytes}
+    _assert_registration(active_graph, Source, Source, Source.copy)
+    _assert_registration(active_graph, Source, str, Source.stringify)
+    _assert_registration(active_graph, Source, bytes, Source.stringify, cost=2)
+    assert set(other_graph.casts) == {Source}
+    _assert_registration(other_graph, Source, str, Source.stringify, cost=3)
+    assert active_graph.cast(Source(3), str) == "3"
+    assert other_graph.cast(Source(3), str) == "3"
+
+
+def test_dataclass_slots_field_name_does_not_shadow_return_type(active_graph):
+    @dataclass(slots=True)
+    class Source:
+        str: str
+
+        @castmethod
+        def stringify(self) -> str:
+            return self.str
+
+    assert set(active_graph.casts) == {Source}
+    assert active_graph.cast(Source("ok"), str) == "ok"
+
+
+def test_dataclass_slots_generic_and_inheritance(active_graph):
+    @dataclass(slots=True)
+    class Box[T]:
+        value: T
+
+        @castmethod
+        def as_list(self) -> list[T]:
+            return [self.value]
+
+        @castmethod
+        def clone(self) -> Box:
+            return Box(self.value)
+
+    @dataclass(slots=True)
+    class LabeledBox[T](Box[T]):
+        label: str
+
+    assert set(active_graph.casts) == {Box}
+    _assert_registration(active_graph, Box, list, Box.as_list)
+    _assert_registration(active_graph, Box, Box, Box.clone)
+    assert active_graph.cast(Box(1), list) == [1]
+    assert active_graph.cast(LabeledBox(2, "x"), list) == [2]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 13), reason="dataclasses slots super() cell update requires Python 3.13+")
+def test_dataclass_slots_preserves_zero_arg_super_in_castmethod(active_graph):
+    class Base:
+        def stringify(self) -> str:
+            return "base"
+
+    @dataclass(slots=True)
+    class Child(Base):
+        value: int
+
+        @castmethod
+        def stringify(self) -> str:
+            return f"{super().stringify()}:{self.value}"
+
+    assert set(active_graph.casts) == {Child}
+    assert Child(5).stringify() == "base:5"
+    assert active_graph.cast(Child(5), str) == "base:5"
+
+
+@pytest.mark.parametrize("abstract_outer", [True, False])
+def test_dataclass_slots_preserves_abstractmethod(active_graph, abstract_outer):
+    @dataclass(slots=True)
+    class Base(ABC):
+        value: int
+
+        if abstract_outer:
+
+            @abstractmethod
+            @castmethod
+            def stringify(self) -> str: ...
+        else:
+
+            @castmethod
+            @abstractmethod
+            def stringify(self) -> str: ...
+
+    assert Base.__abstractmethods__ == frozenset({"stringify"})
+    with pytest.raises(TypeError, match="abstract"):
+        Base(1)
+
+    @dataclass(slots=True)
+    class Concrete(Base):
+        @castmethod
+        def stringify(self) -> str:
+            return str(self.value)
+
+    assert Concrete.__abstractmethods__ == frozenset()
+    assert active_graph.cast(Concrete(9), str) == "9"
+
+
+def test_custom_class_replacing_decorators_update_registration(active_graph):
+    class Mixin:
+        tag = "mixin"
+
+    def add_mixin(cls):
+        return type(cls)(cls.__name__ + "Mixed", (Mixin, *cls.__bases__), dict(cls.__dict__))
+
+    def clone_type(cls):
+        return type(cls)(cls.__name__, cls.__bases__, dict(cls.__dict__))
+
+    @clone_type
+    @add_mixin
+    class Source:
+        @castmethod
+        def stringify(self) -> str:
+            return str(getattr(self, "tag", ""))
+
+    assert set(active_graph.casts) == {Source}
+    _assert_registration(active_graph, Source, str, Source.stringify)
+    assert active_graph.cast(Source(), str) == "mixin"
+
+
+def test_shared_external_castmethod_survives_dataclass_slots_and_factory_reuse(active_graph):
+    @castmethod
+    def stringify(value) -> str:
+        return f"{type(value).__name__}:{value.x}"
+
+    class PlainA:
+        x = 1
+        convert = stringify
+
+    class PlainB:
+        x = 2
+        convert = stringify
+
+    def make_plain():
+        class Dynamic:
+            x = 3
+            convert = stringify
+
+        return Dynamic
+
+    def make_slotted():
+        @dataclass(slots=True)
+        class Slotted:
+            x: int
+            convert = stringify
+
+        return Slotted
+
+    dyn1, dyn2 = make_plain(), make_plain()
+    slot1, slot2 = make_slotted(), make_slotted()
+
+    assert set(active_graph.casts) == {PlainA, PlainB, dyn1, dyn2, slot1, slot2}
+    assert active_graph.cast(PlainA(), str) == "PlainA:1"
+    assert active_graph.cast(PlainB(), str) == "PlainB:2"
+    assert active_graph.cast(dyn1(), str) == "Dynamic:3"
+    assert active_graph.cast(dyn2(), str) == "Dynamic:3"
+    assert active_graph.cast(slot1(4), str) == "Slotted:4"
+    assert active_graph.cast(slot2(5), str) == "Slotted:5"
+
+
+def test_dataclass_slots_with_autocast_metaclass_and_castmethod(active_graph):
+    class Even:
+        pass
+
+    @dataclass(slots=True)
+    class Number(metaclass=autocast(Even)):
+        value: int
+
+        @castmethod(Even)
+        def refine(self):
+            if self.value % 2 == 0:
+                return EvenNumber(self.value)
+            return self
+
+    @dataclass(slots=True)
+    class EvenNumber(Number, Even):
+        pass
+
+    assert set(active_graph.casts) == {Number}
+    assert type(Number(2)) is EvenNumber
+    assert type(Number(3)) is Number
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="Deferred annotations require Python 3.14+")
+def test_dataclass_slots_deferred_annotations_resolve_final_owner(active_graph):
+    namespace: dict[str, Any] = {"__name__": __name__, "castmethod": castmethod, "dataclass": dataclass}
+    exec(  # noqa: S102 - Exercise Python 3.14's deferred annotations without a future import.
+        compile(
+            "@dataclass(slots=True)\n"
+            "class Source:\n"
+            "    value: int\n"
+            "    @castmethod\n"
+            "    def copy(self) -> Source:\n"
+            "        return Source(self.value)\n",
+            "<castmethod>",
+            "exec",
+            dont_inherit=True,
+        ),
+        namespace,
+    )
+    source = namespace["Source"]
+    assert set(active_graph.casts) == {source}
+    _assert_registration(active_graph, source, source, source.copy)
 
 
 if TYPE_CHECKING:

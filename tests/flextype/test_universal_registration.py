@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import partial
+import gc
 from inspect import signature
 from typing import Any, Literal, Protocol, assert_type, runtime_checkable
+import weakref
 
 import pytest
 
@@ -342,3 +345,57 @@ def test_runtime_checkable_method_protocol_is_accepted_as_target_bound(active_gr
     assert active_graph.reachable(int, Runnable)
     assert not active_graph.reachable(int, str)
     assert isinstance(active_graph.cast(1, Runnable), Runnable)
+
+
+def test_universal_castmethod_on_slotted_dataclass_replaces_old_registration(active_graph):
+    other = CasterGraph()
+    seen: list[weakref.ReferenceType[type]] = []
+
+    def capture(cls):
+        seen.append(weakref.ref(cls))
+        return cls
+
+    @dataclass(slots=True)
+    @capture
+    class Wrapped:
+        value: str
+
+        @universal_castmethod(cost=1, target_bound=int)
+        @universal_castmethod(cost=2, target_bound=float, graph=other)
+        def convert(self, target, **_limits: object):
+            return target(self.value)
+
+    assert len(seen) == 1
+    assert seen[0]() is not Wrapped
+    assert set(active_graph.universal_casts) == {Wrapped}
+    assert set(other.universal_casts) == {Wrapped}
+    active_reg = active_graph.get_universal_caster(Wrapped)
+    assert active_reg is not None
+    assert active_reg.cost == 1
+    assert active_reg.target_bound is int
+    other_reg = other.get_universal_caster(Wrapped)
+    assert other_reg is not None
+    assert other_reg.cost == 2
+    assert other_reg.target_bound is float
+    assert active_graph.cast(Wrapped("42"), int) == 42
+    assert other.cast(Wrapped("3.5"), float) == 3.5
+
+    gc.collect()
+    assert seen[0]() is None
+
+
+def test_universal_castmethod_survives_custom_class_replacement(active_graph):
+    def replace(cls):
+        return type(cls)(cls.__name__, cls.__bases__, dict(cls.__dict__))
+
+    @replace
+    class Wrapped:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        @universal_castmethod
+        def convert(self, target, **_limits: object):
+            return target(self.value)
+
+    assert set(active_graph.universal_casts) == {Wrapped}
+    assert active_graph.cast(Wrapped("7"), int) == 7
